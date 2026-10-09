@@ -19,6 +19,6 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Compile scripts
-        run: python -m py_compile analyze_weights.py compress_tensor.py formula_compress.py deep_tensor_experiment.py full_model_codec.py smoke_test_model.py formula_fit_layer.py
+        run: python -m py_compile analyze_weights.py compress_tensor.py formula_compress.py deep_tensor_experiment.py full_model_codec.py smoke_test_model.py formula_fit_layer.py nonlinear_formula_layer.py
       - name: Run codec tests
         run: python -m unittest discover -s tests -v
