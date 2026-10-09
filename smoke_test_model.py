@@ -88,10 +88,15 @@ def main() -> int:
     print(f"[1/3] Carregando processador de: {model_dir}", flush=True)
     try:
         processor = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
+
         print(f"[2/3] Carregando modelo (dtype={args.dtype}, device_map={args.device_map})...", flush=True)
         model = model_loader.from_pretrained(
             str(model_dir),
-            torch_dtype=dtype,
+            dtype=dtype,
             device_map=args.device_map,
             local_files_only=True,
             low_cpu_mem_usage=True,
@@ -102,16 +107,62 @@ def main() -> int:
             "role": "user",
             "content": [{"type": "text", "text": args.prompt}],
         }]
-        inputs = processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        first_device = next(model.parameters()).device
-        inputs = {key: value.to(first_device) if hasattr(value, "to") else value
-                  for key, value in inputs.items()}
+
+        # Prefer the model's own chat template. Some reconstructed folders do
+        # not contain a tokenizer_config.json with chat_template, so fall back
+        # to the official Qwen message tokens for this text-only smoke test.
+        if getattr(processor, "chat_template", None):
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        elif getattr(tokenizer, "chat_template", None):
+            inputs = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        else:
+            print("[AVISO] O tokenizer local não possui chat_template; usando os tokens de conversa Qwen.", flush=True)
+            formatted_prompt = (
+                "<|im_start|>user\\n"
+                + args.prompt
+                + "<|im_end|>\\n<|im_start|>assistant\\n<think>\\n"
+            )
+            inputs = tokenizer(formatted_prompt, return_tensors="pt")
+
+        # With device_map='auto', some parameters may be offloaded and appear
+        # on the meta device. Place inputs according to the input embedding,
+        # not the first arbitrary parameter in the model.
+        input_device = model.get_input_embeddings().weight.device
+        if input_device.type == "meta":
+            device_map = getattr(model, "hf_device_map", {})
+            embed_devices = [
+                device for name, device in device_map.items()
+                if "embed_tokens" in name
+            ]
+            if embed_devices:
+                mapped_device = embed_devices[0]
+                if mapped_device == "disk":
+                    input_device = torch.device("cpu")
+                elif isinstance(mapped_device, int):
+                    input_device = torch.device(f"cuda:{mapped_device}" if torch.cuda.is_available() else "cpu")
+                else:
+                    input_device = torch.device(mapped_device)
+            else:
+                input_device = next(
+                    (parameter.device for parameter in model.parameters() if parameter.device.type != "meta"),
+                    torch.device("cpu"),
+                )
+        inputs = {
+            key: value.to(input_device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
         with torch.inference_mode():
             output_ids = model.generate(
                 **inputs,
@@ -120,7 +171,7 @@ def main() -> int:
                 use_cache=True,
             )
         input_length = inputs["input_ids"].shape[-1]
-        answer = processor.decode(
+        answer = tokenizer.decode(
             output_ids[0][input_length:],
             skip_special_tokens=True,
         ).strip()
