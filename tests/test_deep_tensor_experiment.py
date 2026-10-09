@@ -79,6 +79,7 @@ class DeepTensorExperimentTests(unittest.TestCase):
                     "--oversample", "4",
                     "--power-iterations", "1",
                     "--projection-batch", "2",
+                    "--map-codec", "auto",
                 ],
                 capture_output=True,
                 text=True,
