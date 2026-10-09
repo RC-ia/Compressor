@@ -151,3 +151,33 @@ O teste unitário cria uma pequena matriz Safetensors sintética e verifica empa
 ## Próxima etapa experimental
 
 Executar `compress_tensor.py` no checkpoint local e comparar 16, 64, 256 e 512 representantes, com codebooks FP32 e BF16. Se o arquivo real ficar menor e o erro da projeção permanecer aceitável, o próximo teste é repetir por várias camadas e avaliar logits/perplexidade antes de gerar um checkpoint completo.
+
+
+## Experimento: reconstrução por fórmulas
+
+O script `formula_compress.py` compara **duas fórmulas que ainda usam um índice por peso** com **duas fórmulas que reconstroem blocos inteiros**, além do método K-means existente como referência. Todas as variantes são salvas em NPZ comprimido e medidas pelo tamanho real depois de gravadas.
+
+```bash
+# Teste automático em uma matriz intermediária do checkpoint local
+python formula_compress.py --model ./Qwen3.5-4B --levels 256 --block-size 256
+
+# Escolher exatamente o tensor testado no experimento anterior
+python formula_compress.py --model ./Qwen3.5-4B --tensor-name model.layers.0.self_attn.q_proj.weight --levels 256 --block-size 256 --output-dir resultados_formulas
+
+# Listar candidatos antes de selecionar o tensor
+python formula_compress.py --model ./Qwen3.5-4B --list-tensors
+```
+
+Métodos incluídos:
+
+| Método | Como reconstrói | Informação guardada |
+|---|---|---|
+| `baseline_kmeans` | Escolhe o representante aprendido mais próximo | Codebook e um índice por peso |
+| `formula_arithmetic_levels` | Gera níveis por uma progressão aritmética: `minimum + índice × step` | Dois parâmetros e um índice por peso |
+| `formula_log_companding` | Usa transformação logarítmica assinada e sua inversa | Dois parâmetros e um índice por peso |
+| `formula_block_linear` | Ajusta `w(t) = a + bt` para cada bloco contíguo | Dois coeficientes por bloco; sem índices por peso |
+| `formula_block_cubic` | Ajusta `w(t) = a + bt + ct² + dt³` para cada bloco | Quatro coeficientes por bloco; sem índices por peso |
+
+Os parâmetros dos polinômios são armazenados em FP16 por padrão; use `--coefficient-dtype fp32` para compará-los em FP32. `--block-size` altera o número de pesos descritos por cada polinômio. O relatório consolidado `*_formula_comparison.json` apresenta o tamanho medido, a redução frente ao tensor de origem, RMSE, erro normalizado, similaridade cosseno e teste sintético `W@X` para os cinco métodos.
+
+**Como interpretar:** as fórmulas escalares economizam a tabela explícita de representantes, mas continuam precisando registrar a escolha de nível de cada peso. Os polinômios eliminam os índices individuais e podem reduzir muito mais o arquivo; se os pesos não apresentarem regularidade local na ordem linear, porém, o erro poderá aumentar bastante. Esse é precisamente o resultado a medir, não uma qualidade presumida. O teste trabalha com um tensor por execução e não valida perplexidade nem qualidade linguística do checkpoint completo.
