@@ -98,6 +98,17 @@ class DeepTensorExperimentTests(unittest.TestCase):
                 self.assertGreater(result["artifact_bytes_actual"], 0)
                 self.assertTrue(np.isfinite(result["full_tensor_error"]["rmse_over_weight_std"]))
                 self.assertIsNotNone(result["linear_projection_probe"])
+                if result["kind"] in {"kmeans", "log", "hybrid"}:
+                    self.assertIn(
+                        result["selected_map_codec"],
+                        {"zip_deflate_bitplanes", "zlib_symbols", "raw_bitplanes"},
+                    )
+                    self.assertEqual(
+                        set(result["candidate_codec_sizes_bytes"]),
+                        {"zip_deflate_bitplanes", "zlib_symbols", "raw_bitplanes"},
+                    )
+                else:
+                    self.assertEqual(result["selected_map_codec"], "npz_deflate_no_index_map")
 
 
 if __name__ == "__main__":
