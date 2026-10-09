@@ -167,7 +167,15 @@ def weighted_1d_kmeans(
     sample_weights: np.ndarray | None = None,
     max_iter: int = 30,
 ) -> tuple[np.ndarray, float, float, float]:
-    """Weighted scalar k-means; sample_weights lets stratified samples remain population-weighted."""
+    """Weighted 1-D k-means with multiple deterministic initializations.
+
+    Duplicate values can cause weighted quantiles to produce duplicate seeds.
+    Instead of replacing all quantile seeds with rank-spaced seeds (which can
+    badly hurt skewed distributions), retain the quantile seeds and fill
+    missing centers at the points contributing most to current weighted SSE.
+    A rank-spaced initialization is also tested; the lowest weighted-SSE result
+    is returned.
+    """
     x = np.asarray(sample, dtype=np.float64).reshape(-1)
     if sample_weights is None:
         w = np.ones(x.size, dtype=np.float64)
@@ -179,42 +187,70 @@ def weighted_1d_kmeans(
     x, w = x[good], w[good]
     if x.size == 0:
         raise ValueError("Amostra sem pesos finitos")
+
     values, inverse = np.unique(x, return_inverse=True)
     counts = np.bincount(inverse, weights=w, minlength=values.size).astype(np.float64)
     k = max(1, min(int(k), values.size))
-
     if k == 1:
-        centers = np.array([np.average(values, weights=counts)], dtype=np.float64)
-    else:
-        # Start at evenly spaced ranks when weighted quantiles collide.
-        cumulative = np.cumsum(counts)
-        targets = (np.arange(k, dtype=np.float64) + 0.5) * cumulative[-1] / k
-        idx = np.searchsorted(cumulative, targets, side="left")
-        centers = np.unique(values[np.minimum(idx, values.size - 1)])
-        if centers.size < k:
-            ranks = np.linspace(0, values.size - 1, k).round().astype(np.int64)
-            centers = values[ranks].copy()
+        center = np.array([np.average(values, weights=counts)], dtype=np.float64)
+        error = values - center[0]
+        mse = float(np.average(error * error, weights=counts))
+        mae = float(np.average(np.abs(error), weights=counts))
+        return center.astype(np.float32), mse, mae, math.sqrt(max(mse, 0.0))
 
-    for _ in range(max_iter):
-        centers.sort()
-        if centers.size <= 1:
-            break
-        boundaries = (centers[:-1] + centers[1:]) / 2.0
+    cumulative = np.cumsum(counts)
+    targets = (np.arange(k, dtype=np.float64) + 0.5) * cumulative[-1] / k
+    quantile_indices = np.searchsorted(cumulative, targets, side="left")
+    quantile_centers = np.unique(values[np.minimum(quantile_indices, values.size - 1)])
+
+    # Complete duplicate weighted-quantile seeds without discarding already
+    # useful centers: repeatedly split the location with highest weighted SSE.
+    while quantile_centers.size < k:
+        quantile_centers.sort()
+        boundaries = (quantile_centers[:-1] + quantile_centers[1:]) / 2.0
         assignment = np.searchsorted(boundaries, values, side="right")
-        cluster_weight = np.bincount(assignment, weights=counts, minlength=centers.size)
-        cluster_sum = np.bincount(assignment, weights=counts * values, minlength=centers.size)
-        nonempty = cluster_weight > 0
-        updated = (cluster_sum[nonempty] / cluster_weight[nonempty])
-        if updated.size == centers.size and np.allclose(updated, centers, rtol=1e-7, atol=1e-12):
-            centers = updated
+        residual = values - quantile_centers[assignment]
+        contribution = counts * residual * residual
+        contribution[np.isin(values, quantile_centers)] = -np.inf
+        chosen = int(np.argmax(contribution))
+        if not np.isfinite(contribution[chosen]):
             break
-        centers = updated
-    centers.sort()
-    boundaries = (centers[:-1] + centers[1:]) / 2.0
-    assignment = np.searchsorted(boundaries, values, side="right") if centers.size > 1 else np.zeros(values.size, dtype=np.int64)
-    errors = values - centers[assignment]
-    mse = float(np.average(errors * errors, weights=counts))
-    mae = float(np.average(np.abs(errors), weights=counts))
+        quantile_centers = np.append(quantile_centers, values[chosen])
+
+    # Alternative initialization guarantees broad coverage of distinct values.
+    rank_indices = np.linspace(0, values.size - 1, k).round().astype(np.int64)
+    rank_centers = np.unique(values[rank_indices])
+
+    def fit(seed_centers: np.ndarray) -> tuple[np.ndarray, float, float]:
+        centers = np.unique(np.asarray(seed_centers, dtype=np.float64))
+        for _ in range(max_iter):
+            centers.sort()
+            if centers.size <= 1:
+                break
+            boundaries = (centers[:-1] + centers[1:]) / 2.0
+            assignment = np.searchsorted(boundaries, values, side="right")
+            cluster_weight = np.bincount(assignment, weights=counts, minlength=centers.size)
+            cluster_sum = np.bincount(assignment, weights=counts * values, minlength=centers.size)
+            nonempty = cluster_weight > 0
+            updated = cluster_sum[nonempty] / cluster_weight[nonempty]
+            if updated.size == centers.size and np.allclose(updated, centers, rtol=1e-7, atol=1e-12):
+                centers = updated
+                break
+            centers = updated
+
+        centers.sort()
+        boundaries = (centers[:-1] + centers[1:]) / 2.0
+        assignment = np.searchsorted(boundaries, values, side="right") if centers.size > 1 else np.zeros(values.size, dtype=np.int64)
+        errors = values - centers[assignment]
+        mse = float(np.average(errors * errors, weights=counts))
+        mae = float(np.average(np.abs(errors), weights=counts))
+        return centers, mse, mae
+
+    candidates = [fit(quantile_centers)]
+    # Avoid redundant work if both initializations are identical.
+    if not np.array_equal(quantile_centers, rank_centers):
+        candidates.append(fit(rank_centers))
+    centers, mse, mae = min(candidates, key=lambda item: item[1])
     return centers.astype(np.float32), mse, mae, math.sqrt(max(mse, 0.0))
 
 
