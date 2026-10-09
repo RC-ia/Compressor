@@ -327,13 +327,13 @@ def main() -> int:
     print(f"[source] {source_bytes / 1_000_000:.3f} MB; preparando experimentos ...")
 
     rng = np.random.default_rng(args.seed)
-    max_sample = min(max(args.kmeans_samples), x.size)
+    sample_counts = sorted(set(min(sample_count, x.size) for sample_count in args.kmeans_samples))
+    max_sample = max(sample_counts)
     selected_positions = rng.choice(x.size, size=max_sample, replace=False)
     results: list[dict[str, Any]] = []
 
     # A. K-means with increasing sample sizes, using identical quantizer settings otherwise.
-    for sample_count in args.kmeans_samples:
-        sample_count = min(sample_count, x.size)
+    for sample_count in sample_counts:
         # Prevent duplicate runs on small test fixtures after clamping sample count.
         for groups in args.kmeans_groups:
             name = f"kmeans_n{sample_count}_g{groups}"
