@@ -48,7 +48,7 @@ def discover_mlp_layers(files: list[Path]) -> list[dict[str, Any]]:
     for prefix, members in grouped.items():
         if set(members) != set(SUFFIXES):
             continue
-        layer_match = re.search(r"(?:^|\.)layers\.(\d+)\.mlp\.", prefix)
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)\.mlp(?:\.|$)", prefix)
         result.append({
             "prefix": prefix,
             "layer_index": int(layer_match.group(1)) if layer_match else None,
