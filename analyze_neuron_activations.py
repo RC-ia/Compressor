@@ -28,6 +28,12 @@ from safetensors import safe_open
 import compress_tensor as base
 
 THRESHOLDS = (0.90, 0.95, 0.98, 0.99)
+
+
+class _StopAfterSelectedMlp(RuntimeError):
+    """Internal sentinel used to stop the model forward after the selected MLP."""
+
+
 DEFAULT_TEXT = (
     "A linguagem permite representar ideias, resolver problemas e explicar relações. "
     "Um modelo aprende padrões a partir de muitos exemplos, mas nem todas as unidades "
@@ -269,10 +275,18 @@ def main() -> int:
             captured[key] = output.detach().to(device="cpu", dtype=torch.float32).contiguous()
         return hook
 
+    def capture_mlp_and_stop(_module, _inputs, output):
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        captured["mlp_output"] = output.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        # Stop immediately after the selected MLP. Later transformer layers are
+        # irrelevant to this layer-local analysis and can be heavily disk-offloaded.
+        raise _StopAfterSelectedMlp()
+
     handles = [
         mlp.gate_proj.register_forward_hook(save_output("gate")),
         mlp.up_proj.register_forward_hook(save_output("up")),
-        mlp.register_forward_hook(save_output("mlp_output")),
+        mlp.register_forward_hook(capture_mlp_and_stop),
     ]
 
     # Safetensors is authoritative for the down-projection column vectors; this
@@ -300,10 +314,13 @@ def main() -> int:
     if backbone is None:
         backbone = model
     model_inputs = {key: value.to(device) for key, value in inputs.items()}
-    print("Executando um único forward para capturar ativações reais...", flush=True)
+    print("Executando o forward somente até a saída da MLP-alvo (as camadas seguintes serão puladas)...", flush=True)
     try:
         with torch.inference_mode():
             backbone(**model_inputs, use_cache=False, return_dict=True)
+    except _StopAfterSelectedMlp:
+        # Expected: the hook intentionally interrupts execution after target MLP.
+        pass
     except Exception as error:
         for handle in handles:
             handle.remove()
