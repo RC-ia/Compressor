@@ -132,6 +132,8 @@ def formula_parameters(
         x = chunk.float().cpu().numpy().reshape(-1)
         if not x.size:
             continue
+        if not np.isfinite(x).all():
+            raise ValueError(f"Tensor {tensor_name} contém NaN ou infinito; não é seguro quantizá-lo.")
         absolute = np.abs(x)
         max_abs = max(max_abs, float(np.max(absolute)))
         quota = min(x.size, max(1, int(round(sample_size * x.size / max(1, count)))))
@@ -212,6 +214,8 @@ def write_zlib_payload(
         for chunk in iter_tensor_chunks(sf, tensor_name, shape, chunk_elements):
             if kind == "log":
                 x = chunk.float().cpu().numpy().reshape(-1)
+                if not np.isfinite(x).all():
+                    raise ValueError(f"Tensor {tensor_name} contém NaN ou infinito; codec interrompido.")
                 indices = encode_log_indices(x, scale, zmax, levels)
                 raw = indices.tobytes()
                 if metrics is not None:
@@ -582,7 +586,7 @@ def copy_auxiliary_files(source_root: Path | None, output_dir: Path) -> list[str
             continue
         if any(part in {".git", ".cache", "__pycache__"} for part in source.parts):
             continue
-        if source.suffix == ".safetensors":
+        if source.suffix in {".safetensors", ".rccomp"}:
             continue
         if source.name.endswith(".safetensors.index.json") or source.name == "model.safetensors.index.json":
             continue
@@ -601,7 +605,22 @@ def decode_full_model(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     archive_path = Path(args.archive).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        records = manifest["tensors"]
+        source_model = args.source_model or manifest.get("model_source")
+    source_candidate = Path(source_model).expanduser() if source_model else None
+    if source_candidate is not None and source_candidate.is_dir() and source_candidate.resolve() == output_dir:
+        raise ValueError("O diretório reconstruído precisa ser diferente do diretório do checkpoint original.")
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Remove stale output shards from earlier decoding attempts, but never touch source weights.
+    for stale in output_dir.glob("model-*-of-*.safetensors"):
+        stale.unlink()
+    for stale in output_dir.glob("model.safetensors"):
+        stale.unlink()
+    stale_index = output_dir / "model.safetensors.index.json"
+    if stale_index.exists():
+        stale_index.unlink()
     with zipfile.ZipFile(archive_path, "r") as archive:
         manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
         records = manifest["tensors"]
@@ -646,7 +665,6 @@ def decode_full_model(args: argparse.Namespace) -> int:
         (output_dir / "model.safetensors.index.json").write_text(
             json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    source_model = args.source_model or manifest.get("model_source")
     auxiliary_root = source_auxiliary_root(source_model, args.revision, args.cache_dir) if source_model else None
     copied_files = copy_auxiliary_files(auxiliary_root, output_dir)
     report = {
