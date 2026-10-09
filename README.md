@@ -296,3 +296,32 @@ python formula_fit_layer.py --model ".\Qwen3.5-4B" --frequencies 8,16,32,64,128,
 A fórmula usada é uma soma de senos/cossenos em função das coordenadas da matriz. `--frequencies` define o maior índice de frequência preservado em ambas as dimensões: valores menores armazenam menos coeficientes, mas descartam mais variação. O script testa cada variante usando todos os pesos da matriz, recarrega os coeficientes salvos, reconstrói os valores e reporta RMSE, RMSE normalizado pelo desvio-padrão, erro L2 relativo, similaridade cosseno, tamanho real do artefato e bits efetivos por peso. Resultados em `formula_fit_report.json`.
 
 **Interpretação:** isso testa uma fórmula que gera a matriz sem armazenar um mapa de índices por peso. Se os pesos tiverem pouca estrutura espacial, uma fórmula compacta poderá ter erro próximo ao desvio-padrão original — indicando que ela não conseguiu preservar a matriz. O experimento mede aproximação numérica de pesos; não presume qualidade de geração. Os coeficientes de Fourier não são índices de representantes, e o custo de calcular a fórmula durante a inferência ainda não é avaliado.
+
+
+## Fórmula não linear aprendida para uma camada
+
+`nonlinear_formula_layer.py` testa uma representação diferente da série de Fourier fixa: uma função não linear pequena, com parâmetros aprendidos a partir de **todos os pesos de uma matriz real**. Cada peso é calculado a partir de um código compacto compartilhado pela sua linha, outro pela sua coluna e uma MLP compartilhada. O artefato não guarda índices nem correções individuais por peso.
+
+A fórmula usada é:
+
+```text
+W_hat[r,c] = média + desvio * (
+    MLP(código_linha[r], código_coluna[c])
+    + viés_linha[r] + viés_coluna[c]
+)
+```
+
+Execução no PowerShell, usando o checkpoint local:
+
+```powershell
+python nonlinear_formula_layer.py --model ".\Qwen3.5-4B" --output-dir nonlinear_formula_layer_results
+```
+
+A seleção automática escolhe uma matriz 2D intermediária de até 20 milhões de pesos; para usar uma matriz específica, consulte `--list-tensors` e passe `--tensor-name`. As opções `--embedding-dim`, `--hidden-dim` e `--epochs` controlam o tamanho e o treinamento da fórmula. O padrão faz cinco passadas por todas as linhas.
+
+Resultados:
+- `nonlinear_weight_formula.npz`: somente os parâmetros aprendidos e metadados da fórmula, armazenados em FP16 e comprimidos.
+- `nonlinear_formula_report.json`: tamanho real do artefato, bits efetivos por peso, redução no armazenamento, RMSE normalizado, erro L2 relativo e similaridade cosseno.
+- `weights_nonlinear_reconstructed.npy`: matriz prevista, somente se passar `--save-reconstructed` (gera um arquivo grande para análise).
+
+O número de parâmetros deve ser muito menor que o de pesos para haver compressão. Como a função precisa aprender a distribuição real da matriz, o tempo de ajuste pode aumentar. Uma redução grande de tamanho com erro normalizado próximo de 1 significa que a função não aprendeu informação suficiente; isso não deve ser interpretado como compressão bem-sucedida do modelo. O resultado mede primeiro a aproximação numérica de uma matriz, não a qualidade linguística nem a velocidade de inferência.
