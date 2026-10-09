@@ -435,7 +435,7 @@ def main() -> int:
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     tensor_stem = chosen["name"].replace(".", "_").replace("/", "_")[-100:]
-    artifact_path = outdir / f"{tensor_stem}_{centers.size}groups.npz"
+    artifact_path = outdir / f"{tensor_stem}_{centers.size}groups_{args.codebook_dtype}.npz"
     base_metadata = {
         "format": "compressor_tensor_v2",
         "source_model": args.model,
@@ -524,14 +524,14 @@ def main() -> int:
             "A entropia de ordem zero é um limite ideal baseado apenas em frequências, não o tamanho garantido de um arquivo Huffman/aritimético; dependências sequenciais podem alterar os resultados.",
         ],
     }
-    report_path = outdir / f"{tensor_stem}_{centers.size}groups_report.json"
+    report_path = outdir / f"{tensor_stem}_{centers.size}groups_{args.codebook_dtype}_report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if args.save_reconstructed_safetensors:
         original_dtype_torch = getattr(torch, source_dtype, torch.float32)
         rebuilt = torch.from_numpy(decoded_centers[decoded_indices.astype(np.int64)].reshape(original_shape).copy())
         rebuilt = rebuilt.to(dtype=original_dtype_torch).contiguous()
-        rebuilt_path = outdir / f"{tensor_stem}_{centers.size}groups_reconstructed.safetensors"
+        rebuilt_path = outdir / f"{tensor_stem}_{centers.size}groups_{args.codebook_dtype}_reconstructed.safetensors"
         save_file({"weight": rebuilt}, str(rebuilt_path), metadata={"source_tensor": chosen["name"]})
         report["reconstructed_safetensors_path"] = str(rebuilt_path.resolve())
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
