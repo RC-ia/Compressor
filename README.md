@@ -185,14 +185,14 @@ Os parâmetros dos polinômios são armazenados em FP16 por padrão; use `--coef
 
 ## Experimento profundo: quantização, baixo posto e híbridos
 
-O script `deep_tensor_experiment.py` amplia o teste em três direções e grava cada candidato em NPZ real, relê o arquivo e calcula métricas sobre a reconstrução decodificada:
+O script `deep_tensor_experiment.py` compara três famílias de representação e mede cada arquivo NPZ real depois de recarregar e decodificar:
 
-1. **K-means com amostras crescentes**: compara codebooks aprendidos com 250 mil, 1 milhão e 2 milhões de pesos, usando 64 ou 256 representantes.
-2. **Quantização logarítmica ajustável**: varre 64, 128, 256 e 512 níveis e cinco multiplicadores da escala característica. Os níveis são gerados matematicamente, sem tabela explícita.
-3. **Aproximação de baixo posto**: usa randomized SVD para reconstruir a matriz com fatores FP16 de postos 32, 64, 128, 256 e 512.
-4. **Codificação híbrida**: combina fatores de baixo posto FP16 com codebook K-means sobre o resíduo, testando postos 32, 64 e 128 e 16, 64 ou 256 representantes para o resíduo.
+1. **K-means com amostras crescentes**: 250 mil, 1 milhão e 2 milhões de pesos, com 64 ou 256 representantes.
+2. **Quantização logarítmica**: níveis 128 e 256 com escala característica ajustável (0,25; 0,5; 0,75; 1,0).
+3. **Aproximação de baixo posto**: fatores FP16 para postos 64, 128 e 256.
+4. **Híbrido**: fatores FP16 de postos 64 ou 128, mais quantização K-means do resíduo usando 16, 32 ou 64 representantes.
 
-Execução no tensor visual de 4096 × 4096:
+Execução no tensor visual já usado nos testes:
 
 ```bash
 python deep_tensor_experiment.py --model ./Qwen3.5-4B \
@@ -200,21 +200,21 @@ python deep_tensor_experiment.py --model ./Qwen3.5-4B \
   --output-dir deep_tensor_results
 ```
 
-Os parâmetros podem ser reduzidos para uma execução rápida ou alterados para uma varredura maior:
+### Codificação de índices comparável
+
+Para K-means, quantização logarítmica e híbridos, o script mede o tamanho real usando o mesmo conjunto de codificadores: bitplanes com ZIP/DEFLATE, símbolos com zlib e bitplanes sem compressão. Por padrão, escolhe o menor arquivo medido e registra `selected_map_codec` e `candidate_codec_sizes_bytes` no relatório. Para obrigar todos os métodos a usar exatamente o mesmo codificador, passe `--map-codec zlib_symbols` (ou outra opção disponível).
 
 ```bash
+# Forçar o mesmo codificador de índices em toda a comparação
 python deep_tensor_experiment.py --model ./Qwen3.5-4B \
   --tensor-name model.visual.merger.linear_fc1.weight \
-  --kmeans-samples 250000,1000000,2000000 \
-  --kmeans-groups 64,256 \
-  --log-levels 64,128,256,512 --log-scales 0.25,0.5,1,2,4 \
-  --ranks 32,64,128,256,512 \
-  --hybrid-ranks 32,64,128 --residual-groups 16,64,256 \
-  --residual-sample-size 500000 --oversample 32 --power-iterations 2
+  --map-codec zlib_symbols --output-dir deep_tensor_zlib
 ```
 
-O relatório consolidado `deep_comparison.json` guarda configuração, tamanho efetivo, economia frente ao tensor original, erro de reconstrução e erro W@X para cada candidato. `deep_comparison.csv` facilita ordenar e comparar os resultados. Arquivos individuais NPZ e relatórios JSON também ficam no diretório de saída.
+Ajustes avançados podem ser feitos por `--kmeans-samples`, `--kmeans-groups`, `--log-levels`, `--log-scales`, `--ranks`, `--hybrid-ranks` e `--residual-groups`. Use `--timing-repeats` para controlar as repetições do benchmark exploratório de projeção fatorada.
 
-O script separa **tempo de decodificação/reconstrução offline** de um **benchmark exploratório da projeção fatorada**. Para candidatos de baixo posto, mede `U @ (V.T @ X)` diretamente, sem materializar `W = U @ V.T` durante essa projeção, e compara o tempo com `W @ X` denso usando NumPy FP32 na CPU. Os tempos são apenas uma comparação local de operações matriciais: não são tokens/segundo de um LLM nem predizem a velocidade em GPU. Para ajustar o número de repetições, use `--timing-repeats 5`.
+O relatório `deep_comparison.json` contém as configurações, tamanho real do arquivo, codificador escolhido, RMSE normalizado, similaridade cosseno, erro relativo W@X e tempo de decodificação offline. `deep_comparison.csv` facilita comparar os métodos. Os arquivos NPZ individuais e relatórios detalhados ficam no diretório de saída.
 
-**Cuidados de interpretação:** randomized SVD é uma aproximação, não uma SVD exata; aumente `--oversample` ou `--power-iterations` para estudar a precisão à custa de tempo. O ensaio W@X é sintético. Uma redução forte do arquivo ou um cosseno alto não substitui a validação de logits, ativações e perplexidade do modelo completo.
+Para candidatos de baixo posto, o script também compara `U @ (V.T @ X)` com `W @ X` denso usando NumPy FP32 na CPU, sem reconstruir a matriz (W) durante a multiplicação fatorada. Esse é um benchmark de operação matricial, não tokens por segundo do modelo e não uma previsão de velocidade na GPU.
+
+**Limitações:** randomized SVD é uma aproximação; mais `--oversample` e `--power-iterations` podem aumentar a precisão com custo de tempo. O teste W@X usa entrada sintética e não substitui a avaliação de logits, ativações reais ou perplexidade do modelo inteiro.
