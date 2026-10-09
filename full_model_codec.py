@@ -268,6 +268,8 @@ def iter_zlib_payload(archive: zipfile.ZipFile, payload_name: str,
         tail = decoder.flush()
         if tail:
             yield tail
+        if not decoder.eof:
+            raise ValueError(f"Fluxo zlib truncado ou incompleto: {payload_name}")
 
 
 def verify_payloads(archive_path: Path, records: list[dict[str, Any]]) -> dict[str, Any]:
