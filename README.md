@@ -371,3 +371,20 @@ O teste compara todos os pares por cosseno quando CUDA está disponível. També
 O relatório `neuron_similarity_report.json` conta pares nos quais **todos os três vetores** ultrapassam os limiares de similaridade 0,90, 0,95, 0,98 e 0,99, respeitando também os filtros de escala/sinal. Salva ainda os melhores pares candidatos e os cossenos individuais.
 
 **Limitação importante:** este é um primeiro filtro baseado nos pesos, não uma prova de equivalência funcional. Para confirmar que dois neurônios são de fato substituíveis, seria necessário comparar suas ativações e contribuições usando entradas reais. O script não poda nem altera o checkpoint.
+
+
+## Análise funcional de neurônios por ativações reais
+
+`analyze_neuron_activations.py` complementa a comparação de pesos: carrega o modelo local, executa **um único forward** com um texto de calibração, captura as ativações de `gate_proj` e `up_proj` na camada escolhida e calcula a ativação gated de cada neurônio. Então procura pares com traços de ativação correlacionados e estima o erro de saída se a contribuição de um neurônio for fundida no outro, ajustando a coluna correspondente de `down_proj`.
+
+```powershell
+# Analisar a camada 0 com um único texto de calibração
+.\.venv-smoke\Scripts\python.exe analyze_neuron_activations.py --model ".\Qwen3.5-4B" --layer-index 0 --max-tokens 256 --output-dir neuron_activation_results
+
+# Usar texto local para melhorar a amostra de calibração, sem executar geração
+.\.venv-smoke\Scripts\python.exe analyze_neuron_activations.py --model ".\Qwen3.5-4B" --layer-index 0 --text-file ".\calibration.txt" --max-tokens 512
+```
+
+O arquivo `neuron_activation_report.json` registra quantos pares têm correlação absoluta de ativação acima de 0,90, 0,95, 0,98 e 0,99, além dos melhores pares. Para cada candidato, estima o erro na contribuição combinada dos dois neurônios e uma estimativa do erro relativo perante a saída total da MLP se um fosse absorvido no outro.
+
+Essa é uma aproximação funcional melhor que comparar apenas os pesos, mas os resultados dependem do texto usado. Um único texto serve para filtrar candidatos; antes de podar, seria necessário confirmar os melhores pares em mais entradas. O script apenas analisa e não modifica o checkpoint.
