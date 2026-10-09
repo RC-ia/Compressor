@@ -17,7 +17,7 @@ from pathlib import Path
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Directory containing reconstructed Safetensors and config")
-    parser.add_argument("--max-new-tokens", type=int, default=40)
+    parser.add_argument("--max-new-tokens", type=int, default=24)
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16"], default="float16",
                         help="Runtime dtype. float16 is usually more compatible with consumer GPUs.")
     parser.add_argument("--device-map", default="auto", help="Transformers device map; default auto can offload to CPU")
@@ -118,6 +118,7 @@ def main() -> int:
                 tokenize=True,
                 return_dict=True,
                 return_tensors="pt",
+                enable_thinking=False,
             )
         elif getattr(tokenizer, "chat_template", None):
             inputs = tokenizer.apply_chat_template(
@@ -126,13 +127,14 @@ def main() -> int:
                 tokenize=True,
                 return_dict=True,
                 return_tensors="pt",
+                enable_thinking=False,
             )
         else:
-            print("[AVISO] O tokenizer local não possui chat_template; usando os tokens de conversa Qwen.", flush=True)
+            print("[AVISO] O tokenizer local não possui chat_template; usando formato Qwen sem raciocínio explícito.", flush=True)
             formatted_prompt = (
                 "<|im_start|>user\n"
                 + args.prompt
-                + "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+                + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
             )
             inputs = tokenizer(formatted_prompt, return_tensors="pt")
 
