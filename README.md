@@ -325,3 +325,24 @@ Resultados:
 - `weights_nonlinear_reconstructed.npy`: matriz prevista, somente se passar `--save-reconstructed` (gera um arquivo grande para análise).
 
 O número de parâmetros deve ser muito menor que o de pesos para haver compressão. Como a função precisa aprender a distribuição real da matriz, o tempo de ajuste pode aumentar. Uma redução grande de tamanho com erro normalizado próximo de 1 significa que a função não aprendeu informação suficiente; isso não deve ser interpretado como compressão bem-sucedida do modelo. O resultado mede primeiro a aproximação numérica de uma matriz, não a qualidade linguística nem a velocidade de inferência.
+
+
+## Experimento: mapa de representantes preditivo
+
+`predictive_map_experiment.py` testa se um decodificador pequeno consegue explorar padrões no mapa de índices de uma matriz real. O tensor é quantizado para até 16 representantes (4 bits por código), depois o script compara o mapa direto com resíduos preditivos usando uma tabela condicional minúscula. O preditor usa o código imediatamente acima de cada posição; também testa a matriz transposta, que corresponde a prever pelo código anterior na outra dimensão.
+
+O decoder trabalha uma linha por vez e vetoriza todas as colunas daquela linha. O teste informa tanto o tamanho real em disco quanto a velocidade de decodificação, porque uma economia de espaço que torne a reconstrução lenta não atende ao objetivo.
+
+```powershell
+# Usar a mesma matriz visual do experimento anterior
+python predictive_map_experiment.py --model ".\Qwen3.5-4B" --tensor-name "model.visual.merger.linear_fc1.weight" --output-dir predictive_map_results
+
+# Listar tensores para escolher outra matriz
+python predictive_map_experiment.py --model ".\Qwen3.5-4B" --list-tensors
+```
+
+Arquivos de saída:
+- `predictive_representative_map.npz`: representantes FP16, tabela preditiva e payload comprimido do mapa residual.
+- `predictive_map_report.json`: tamanho do mapa direto e do mapa preditivo, entropia dos índices/resíduos, acerto do preditor, erro da reconstrução, e velocidade em milhões de índices por segundo.
+
+O mapa preditivo tem de ser decodificado **exatamente** para recuperar os índices; a aproximação numérica resulta apenas dos 16 representantes. Esse é um primeiro teste de referência, não uma micro-LLM: se a estrutura local já não reduzir o mapa de modo significativo ou ficar mais lenta, isso mede o obstáculo que um decodificador neural mais complexo teria de superar. O tamanho de uma tabela preditiva aprendida por matriz é contabilizado no artefato salvo.
