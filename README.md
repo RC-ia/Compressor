@@ -181,3 +181,38 @@ Métodos incluídos:
 Os parâmetros dos polinômios são armazenados em FP16 por padrão; use `--coefficient-dtype fp32` para compará-los em FP32. `--block-size` altera o número de pesos descritos por cada polinômio. O relatório consolidado `*_formula_comparison.json` apresenta o tamanho medido, a redução frente ao tensor de origem, RMSE, erro normalizado, similaridade cosseno e teste sintético `W@X` para os cinco métodos.
 
 **Como interpretar:** as fórmulas escalares economizam a tabela explícita de representantes, mas continuam precisando registrar a escolha de nível de cada peso. Os polinômios eliminam os índices individuais e podem reduzir muito mais o arquivo; se os pesos não apresentarem regularidade local na ordem linear, porém, o erro poderá aumentar bastante. Esse é precisamente o resultado a medir, não uma qualidade presumida. O teste trabalha com um tensor por execução e não valida perplexidade nem qualidade linguística do checkpoint completo.
+
+
+## Experimento profundo: quantização, baixo posto e híbridos
+
+O script `deep_tensor_experiment.py` amplia o teste em três direções e grava cada candidato em NPZ real, relê o arquivo e calcula métricas sobre a reconstrução decodificada:
+
+1. **K-means com amostras crescentes**: compara codebooks aprendidos com 250 mil, 1 milhão e 2 milhões de pesos, usando 64 ou 256 representantes.
+2. **Quantização logarítmica ajustável**: varre 64, 128, 256 e 512 níveis e cinco multiplicadores da escala característica. Os níveis são gerados matematicamente, sem tabela explícita.
+3. **Aproximação de baixo posto**: usa randomized SVD para reconstruir a matriz com fatores FP16 de postos 32, 64, 128, 256 e 512.
+4. **Codificação híbrida**: combina fatores de baixo posto FP16 com codebook K-means sobre o resíduo, testando postos 32, 64 e 128 e 16, 64 ou 256 representantes para o resíduo.
+
+Execução no tensor visual de 4096 × 4096:
+
+```bash
+python deep_tensor_experiment.py --model ./Qwen3.5-4B \
+  --tensor-name model.visual.merger.linear_fc1.weight \
+  --output-dir deep_tensor_results
+```
+
+Os parâmetros podem ser reduzidos para uma execução rápida ou alterados para uma varredura maior:
+
+```bash
+python deep_tensor_experiment.py --model ./Qwen3.5-4B \
+  --tensor-name model.visual.merger.linear_fc1.weight \
+  --kmeans-samples 250000,1000000,2000000 \
+  --kmeans-groups 64,256 \
+  --log-levels 64,128,256,512 --log-scales 0.25,0.5,1,2,4 \
+  --ranks 32,64,128,256,512 \
+  --hybrid-ranks 32,64,128 --residual-groups 16,64,256 \
+  --residual-sample-size 500000 --oversample 32 --power-iterations 2
+```
+
+O relatório consolidado `deep_comparison.json` guarda configuração, tamanho efetivo, economia frente ao tensor original, erro de reconstrução e erro W@X para cada candidato. `deep_comparison.csv` facilita ordenar e comparar os resultados. Arquivos individuais NPZ e relatórios JSON também ficam no diretório de saída.
+
+**Cuidados de interpretação:** randomized SVD é uma aproximação, não uma SVD exata; aumente `--oversample` ou `--power-iterations` para estudar a precisão à custa de tempo. O ensaio W@X é sintético. Uma redução forte do arquivo ou um cosseno alto não substitui a validação de logits, ativações e perplexidade do modelo completo.
