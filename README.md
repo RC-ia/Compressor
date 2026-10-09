@@ -20,7 +20,8 @@ Isso não é uma compressão sem custo de informação: o mapa de associações 
   - **global**: um codebook para todos os tensores;
   - **layer**: codebook compartilhado por camada do backbone; embeddings, normas finais e tensores sem índice de camada ficam isolados;
   - **tensor**: codebook independente por tensor.
-- Ajusta representantes com k-means escalar ponderado. Os pesos da amostra compensam a cobertura mínima por tensor, para que tensores pequenos não dominem artificialmente o ajuste.
+- Ajusta representantes com k-means escalar ponderado, usando inicializações alternativas para reduzir falhas em distribuições assimétricas e evitando descartar boas sementes de quantis quando ocorrem duplicatas.
+- Os pesos da amostra compensam a cobertura mínima por tensor, para que tensores pequenos não dominem artificialmente o ajuste.
 - Avalia o erro em dados mantidos fora do ajuste, ponderado pelo número real de parâmetros de cada tensor.
 - Estima armazenamento com índices empacotados e codebooks FP32, FP16 ou BF16.
 
