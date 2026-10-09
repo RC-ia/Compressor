@@ -295,6 +295,7 @@ def main() -> int:
     parser.add_argument("--output-dir", default="deep_tensor_results")
     parser.add_argument("--kmeans-samples", type=parse_int_list, default=parse_int_list("250000,1000000,2000000"))
     parser.add_argument("--kmeans-groups", type=parse_int_list, default=parse_int_list("64,256"))
+    parser.add_argument("--residual-sample-size", type=int, default=500_000, help="Amostra para treinar codebooks dos resíduos híbridos")
     parser.add_argument("--log-levels", type=parse_int_list, default=parse_int_list("64,128,256,512"))
     parser.add_argument("--log-scales", type=parse_float_list, default=parse_float_list("0.25,0.5,1,2,4"))
     parser.add_argument("--ranks", type=parse_int_list, default=parse_int_list("32,64,128,256,512"))
@@ -399,7 +400,8 @@ def main() -> int:
         rank = min(rank, max_rank)
         left, right, lowrank = factor_cache[rank]
         residual = (matrix - lowrank).reshape(-1)
-        residual_sample = residual[selected_positions[:max_sample]]
+        residual_sample_count = min(max(1, args.residual_sample_size), max_sample, x.size)
+        residual_sample = residual[selected_positions[:residual_sample_count]]
         for groups in args.residual_groups:
             name = f"hybrid_r{rank}_residual_g{groups}"
             centers = np.sort(base.weighted_kmeans_1d(residual_sample, groups))
@@ -430,6 +432,7 @@ def main() -> int:
             "kmeans_samples": args.kmeans_samples, "kmeans_groups": args.kmeans_groups,
             "log_levels": args.log_levels, "log_scales": args.log_scales, "ranks": args.ranks,
             "hybrid_ranks": args.hybrid_ranks, "residual_groups": args.residual_groups,
+            "residual_sample_size": args.residual_sample_size,
             "oversample": args.oversample, "power_iterations": args.power_iterations,
         },
         "results_sorted_by_normalized_rmse": results,
