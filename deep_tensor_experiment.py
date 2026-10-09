@@ -218,6 +218,71 @@ def projection_probe(
     }
 
 
+def factorized_projection_probe(
+    archive_path: Path,
+    original: np.ndarray,
+    shape: tuple[int, int],
+    batch: int,
+    seed: int,
+    repeats: int = 5,
+) -> dict[str, Any] | None:
+    """Benchmark direct U(V^T X) without rebuilding W, using NumPy FP32 on CPU."""
+    if batch < 1:
+        return None
+    with np.load(archive_path, allow_pickle=False) as archive:
+        if "left" not in archive or "right" not in archive:
+            return None
+        left = archive["left"].astype(np.float32)
+        right = archive["right"].astype(np.float32)
+    matrix = np.asarray(original, dtype=np.float32).reshape(shape)
+    rng = np.random.default_rng(seed)
+    inputs = rng.standard_normal((shape[1], batch), dtype=np.float32)
+    inputs /= math.sqrt(max(1, shape[1]))
+    reference = matrix @ inputs
+
+    def dense_op() -> np.ndarray:
+        return matrix @ inputs
+
+    def factored_op() -> np.ndarray:
+        return left @ (right.T @ inputs)
+
+    # Warm up BLAS and separate timing from first-call initialization.
+    for _ in range(2):
+        dense_op()
+        factored_op()
+    dense_times: list[float] = []
+    factor_times: list[float] = []
+    factored_output = np.empty_like(reference)
+    for _ in range(max(1, repeats)):
+        t0 = time.perf_counter()
+        dense_op()
+        dense_times.append(time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        factored_output = factored_op()
+        factor_times.append(time.perf_counter() - t0)
+
+    diff = reference.astype(np.float64) - factored_output.astype(np.float64)
+    error = float(np.sqrt(np.mean(diff * diff)))
+    rms = float(np.sqrt(np.mean(reference.astype(np.float64) ** 2)))
+    dense_ms = float(np.median(dense_times) * 1000.0)
+    factored_ms = float(np.median(factor_times) * 1000.0)
+    return {
+        "backend": "NumPy FP32 CPU; timing is relative and not a model tokens/second benchmark",
+        "batch_size": int(batch),
+        "rank": int(left.shape[1]),
+        "dense_W_times_X_median_ms": dense_ms,
+        "direct_U_times_VTX_median_ms": factored_ms,
+        "dense_over_factorized_speed_ratio": dense_ms / factored_ms if factored_ms > 0 else None,
+        "output_rmse_over_original_rms": error / rms if rms else 0.0,
+        "output_cosine_similarity": float(
+            np.sum(reference.astype(np.float64) * factored_output.astype(np.float64))
+            / max(1e-30, np.linalg.norm(reference.astype(np.float64)) * np.linalg.norm(factored_output.astype(np.float64)))
+        ),
+        "timing_repeats": int(max(1, repeats)),
+        "note": "O caminho fatorado calcula U(V^T X) diretamente: não materializa nem recalcula a matriz W completa por token.",
+    }
+
+
 def save_and_measure(
     outdir: Path,
     name: str,
@@ -229,6 +294,7 @@ def save_and_measure(
     shape: tuple[int, int],
     projection_batch: int,
     seed: int,
+    timing_repeats: int = 5,
 ) -> dict[str, Any]:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
     path = outdir / f"{safe}.npz"
@@ -242,9 +308,15 @@ def save_and_measure(
     np.savez_compressed(path, **arrays)
     file_bytes = path.stat().st_size
     # Decode from the actual bytes on disk so metrics include storage dtype rounding.
+    decode_started = time.perf_counter()
     rebuilt = decode_from_archive(path, name)
+    decode_seconds = time.perf_counter() - decode_started
     metrics = reconstruction_metrics(original, rebuilt)
     projection = projection_probe(original, rebuilt, shape, projection_batch, seed)
+    direct_factorized = (
+        factorized_projection_probe(path, original, shape, projection_batch, seed, timing_repeats)
+        if kind == "lowrank" else None
+    )
     result = {
         "method": name,
         "kind": kind,
@@ -256,6 +328,8 @@ def save_and_measure(
         "savings_pct_vs_source": (1.0 - file_bytes / source_bytes) * 100.0 if source_bytes else 0.0,
         "full_tensor_error": metrics,
         "linear_projection_probe": projection,
+        "archive_decode_seconds_offline": decode_seconds,
+        "direct_factorized_projection_benchmark": direct_factorized,
         "metadata": {k: v for k, v in meta.items() if k not in ("shape", "numel", "kind", "method")},
     }
     (outdir / f"{safe}_report.json").write_text(
@@ -304,6 +378,7 @@ def main() -> int:
     parser.add_argument("--oversample", type=int, default=32)
     parser.add_argument("--power-iterations", type=int, default=2)
     parser.add_argument("--projection-batch", type=int, default=4)
+    parser.add_argument("--timing-repeats", type=int, default=5, help="Repetições para benchmark NumPy da projeção fatorada")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -347,7 +422,7 @@ def main() -> int:
                 {"requested_sample_count": int(sample_count), "requested_groups": int(groups),
                  "actual_groups": int(centers.size), "index_bits": bits,
                  "training_seed": int(args.seed)},
-                x, source_bytes, shape, args.projection_batch, args.seed,
+                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats,
             ))
 
     # B. Formula-generated signed log codebook across levels and characteristic scales.
@@ -361,7 +436,7 @@ def main() -> int:
                 outdir, name, "log",
                 {"packed_indices": packed, "formula_parameters": params_array},
                 {"levels": int(levels), "index_bits": bits, **params},
-                x, source_bytes, shape, args.projection_batch, args.seed,
+                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats,
             ))
 
     # C. One randomized SVD basis, reused at all requested ranks.
@@ -392,7 +467,7 @@ def main() -> int:
             {"rank": int(rank), "factor_dtype": "fp16", "oversample": int(args.oversample),
              "power_iterations": int(args.power_iterations),
              "factor_parameter_bytes": int(left.nbytes + right.nbytes)},
-            x, source_bytes, shape, args.projection_batch, args.seed,
+            x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats,
         ))
 
     # D. Hybrid: low-rank structure plus quantized residual, retaining no per-weight FP16 values.
@@ -450,7 +525,7 @@ def main() -> int:
     csv_path = outdir / "deep_comparison.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["method", "artifact_MB", "savings_pct", "rmse_over_std", "weight_cosine", "W@X_relative_error"])
+        writer.writerow(["method", "artifact_MB", "savings_pct", "rmse_over_std", "weight_cosine", "W@X_relative_error", "offline_decode_seconds", "direct_factorized_ms", "dense_over_factorized_ratio"])
         for item in results:
             probe = item["linear_projection_probe"]
             writer.writerow([
@@ -459,15 +534,18 @@ def main() -> int:
                 f"{item['full_tensor_error']['rmse_over_weight_std']:.8f}",
                 f"{item['full_tensor_error']['cosine_similarity_flat_weights']:.8f}",
                 "" if probe is None else f"{probe['output_rmse_over_original_rms']:.8f}",
+                f"{item['archive_decode_seconds_offline']:.6f}",
+                "" if item["direct_factorized_projection_benchmark"] is None else f"{item['direct_factorized_projection_benchmark']['direct_U_times_VTX_median_ms']:.6f}",
+                "" if item["direct_factorized_projection_benchmark"] is None else f"{item['direct_factorized_projection_benchmark']['dense_over_factorized_speed_ratio']:.6f}",
             ])
 
     print("\n=== DEEP TENSOR EXPERIMENT ===")
-    print(f"{'MÉTODO':34s} {'ARQUIVO MB':>11s} {'REDUÇÃO':>9s} {'RMSE/std':>10s} {'COSSENO':>10s} {'ERRO W@X':>10s}")
+    print(f"{'MÉTODO':34s} {'ARQUIVO MB':>11s} {'REDUÇÃO':>9s} {'RMSE/std':>10s} {'COSSENO':>10s} {'ERRO W@X':>10s} {'DECODE s':>9s}")
     for item in results:
         metric = item["full_tensor_error"]
         probe = item["linear_projection_probe"]
         werr = probe["output_rmse_over_original_rms"] if probe else float("nan")
-        print(f"{item['method']:34s} {item['artifact_MB_actual']:11.3f} {item['savings_pct_vs_source']:8.2f}% {metric['rmse_over_weight_std']:10.5f} {metric['cosine_similarity_flat_weights']:10.6f} {werr:10.5f}")
+        print(f"{item['method']:34s} {item['artifact_MB_actual']:11.3f} {item['savings_pct_vs_source']:8.2f}% {metric['rmse_over_weight_std']:10.5f} {metric['cosine_similarity_flat_weights']:10.6f} {werr:10.5f} {item['archive_decode_seconds_offline']:9.3f}")
     print(f"\nRelatório JSON: {report_path.resolve()}")
     print(f"Resumo CSV   : {csv_path.resolve()}")
     print(f"Tempo total  : {time.time() - started:.2f}s")
