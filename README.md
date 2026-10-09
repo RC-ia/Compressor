@@ -273,3 +273,26 @@ py -3.11 -m venv .venv-smoke
 O script usa FP16 por padrão e `device_map="auto"`, que pode distribuir camadas entre a GPU e a CPU. O checkpoint em disco permanece no dtype reconstruído. Se a importação de um componente do Transformers falhar, o script exibe as versões instaladas e o traceback completo. O teste limita a geração a 24 tokens e desativa o modo de raciocínio do Qwen3.5 para evitar gastar o orçamento curto em uma cadeia de pensamento. Se o processador/tokenizer reconstruído não tiver `chat_template`, ele usa os tokens de conversa do Qwen e fecha o bloco `<think>` vazio para solicitar uma resposta direta; também considera que parte dos pesos pode estar descarregada em CPU/disco.
 
 O teste termina com `[PASS]` se o modelo produzir texto não vazio. Isso comprova apenas carregamento e geração básica, não equivalência de qualidade com o modelo original.
+
+
+## Fórmula global para reconstruir uma matriz de camada
+
+O script `formula_fit_layer.py` extrai **todos os pesos de uma única matriz 2D real** para `weights_original.npy` e ajusta aproximações por uma fórmula trigonométrica global (série de Fourier 2D). Em vez de guardar cada peso, cada variante guarda apenas coeficientes de frequência baixa; os pesos aproximados são gerados pela fórmula inversa. Os coeficientes são armazenados como pares FP16 e o script mede o tamanho real do arquivo salvo.
+
+```powershell
+# Listar matrizes/tensores do checkpoint local
+python formula_fit_layer.py --model ".\Qwen3.5-4B" --list-tensors
+
+# Escolher automaticamente uma matriz 2D de tamanho intermediário
+python formula_fit_layer.py --model ".\Qwen3.5-4B" --output-dir formula_fit_layer_results
+
+# Ou especificar o tensor exato exibido por --list-tensors
+python formula_fit_layer.py --model ".\Qwen3.5-4B" --tensor-name "model.visual.merger.linear_fc1.weight"
+
+# Reduzir ou aumentar o orçamento de coeficientes
+python formula_fit_layer.py --model ".\Qwen3.5-4B" --frequencies 8,16,32,64,128,256
+```
+
+A fórmula usada é uma soma de senos/cossenos em função das coordenadas da matriz. `--frequencies` define o maior índice de frequência preservado em ambas as dimensões: valores menores armazenam menos coeficientes, mas descartam mais variação. O script testa cada variante usando todos os pesos da matriz, recarrega os coeficientes salvos, reconstrói os valores e reporta RMSE, RMSE normalizado pelo desvio-padrão, erro L2 relativo, similaridade cosseno, tamanho real do artefato e bits efetivos por peso. Resultados em `formula_fit_report.json`.
+
+**Interpretação:** isso testa uma fórmula que gera a matriz sem armazenar um mapa de índices por peso. Se os pesos tiverem pouca estrutura espacial, uma fórmula compacta poderá ter erro próximo ao desvio-padrão original — indicando que ela não conseguiu preservar a matriz. O experimento mede aproximação numérica de pesos; não presume qualidade de geração. Os coeficientes de Fourier não são índices de representantes, e o custo de calcular a fórmula durante a inferência ainda não é avaliado.
