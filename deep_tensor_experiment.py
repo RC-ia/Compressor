@@ -443,9 +443,9 @@ def main() -> int:
     parser.add_argument("--kmeans-samples", type=parse_int_list, default=parse_int_list("250000,1000000,2000000"))
     parser.add_argument("--kmeans-groups", type=parse_int_list, default=parse_int_list("64,256"))
     parser.add_argument("--residual-sample-size", type=int, default=500_000, help="Amostra para treinar codebooks dos resíduos híbridos")
-    parser.add_argument("--log-levels", type=parse_int_list, default=parse_int_list("64,128,256,512"))
+    parser.add_argument("--log-levels", type=parse_int_list, default=parse_int_list("128,256"))
     parser.add_argument("--log-scales", type=parse_float_list, default=parse_float_list("0.25,0.5,0.75,1"))
-    parser.add_argument("--ranks", type=parse_int_list, default=parse_int_list("32,64,128,256,512"))
+    parser.add_argument("--ranks", type=parse_int_list, default=parse_int_list("64,128,256"))
     parser.add_argument("--hybrid-ranks", type=parse_int_list, default=parse_int_list("64,128"))
     parser.add_argument("--residual-groups", type=parse_int_list, default=parse_int_list("16,32,64"))
     parser.add_argument("--oversample", type=int, default=32)
@@ -564,7 +564,7 @@ def main() -> int:
                  "residual_groups_actual": int(centers.size), "index_bits": bits,
                  "factor_dtype": "fp16", "residual_codebook_dtype": "fp32",
                  "oversample": int(args.oversample), "power_iterations": int(args.power_iterations)},
-                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats,
+                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats, args.map_codec,
             ))
 
     results.sort(key=lambda item: (item["full_tensor_error"]["rmse_over_weight_std"], item["artifact_bytes_actual"]))
@@ -615,12 +615,12 @@ def main() -> int:
             ])
 
     print("\n=== DEEP TENSOR EXPERIMENT ===")
-    print(f"{'MÉTODO':34s} {'ARQUIVO MB':>11s} {'REDUÇÃO':>9s} {'RMSE/std':>10s} {'COSSENO':>10s} {'ERRO W@X':>10s} {'DECODE s':>9s}")
+    print(f"{'MÉTODO':34s} {'ARQUIVO MB':>11s} {'REDUÇÃO':>9s} {'CODEC':>22s} {'RMSE/std':>10s} {'COSSENO':>10s} {'ERRO W@X':>10s} {'DECODE s':>9s}")
     for item in results:
         metric = item["full_tensor_error"]
         probe = item["linear_projection_probe"]
         werr = probe["output_rmse_over_original_rms"] if probe else float("nan")
-        print(f"{item['method']:34s} {item['artifact_MB_actual']:11.3f} {item['savings_pct_vs_source']:8.2f}% {metric['rmse_over_weight_std']:10.5f} {metric['cosine_similarity_flat_weights']:10.6f} {werr:10.5f} {item['archive_decode_seconds_offline']:9.3f}")
+        print(f"{item['method']:34s} {item['artifact_MB_actual']:11.3f} {item['savings_pct_vs_source']:8.2f}% {item['selected_map_codec']:>22s} {metric['rmse_over_weight_std']:10.5f} {metric['cosine_similarity_flat_weights']:10.6f} {werr:10.5f} {item['archive_decode_seconds_offline']:9.3f}")
     print(f"\nRelatório JSON: {report_path.resolve()}")
     print(f"Resumo CSV   : {csv_path.resolve()}")
     print(f"Tempo total  : {time.time() - started:.2f}s")
