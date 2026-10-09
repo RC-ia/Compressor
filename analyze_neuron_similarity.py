@@ -123,10 +123,14 @@ def analyze_similarity(
     all_ids = torch.arange(n, device=normalized["gate"].device)
 
     with torch.inference_mode():
+        total_blocks = math.ceil(n / batch_rows)
         for start in range(0, n, batch_rows):
             end = min(n, start + batch_rows)
             row_ids = all_ids[start:end]
             cg, cu, cd, gate_ratio, effective_ratio = cosine_block(normalized, norms, row_ids, all_ids)
+            block_number = start // batch_rows + 1
+            if block_number == 1 or block_number % 8 == 0 or block_number == total_blocks:
+                print(f"[similaridade] bloco {block_number}/{total_blocks}", flush=True)
 
             upper = all_ids[None, :] > row_ids[:, None]
             sign_compatible = (cu * cd) > 0
