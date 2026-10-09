@@ -100,10 +100,11 @@ class FullModelCodecTests(unittest.TestCase):
             torch.testing.assert_close(rebuilt_bias, original_bias, rtol=0, atol=0)
             torch.testing.assert_close(rebuilt_int, original_integer, rtol=0, atol=0)
             torch.testing.assert_close(rebuilt_zeros, original_zeros, rtol=0, atol=0)
-            self.assertLess(
-                float(torch.sqrt(torch.mean((rebuilt_weight.float() - original_weight.float()) ** 2))),
-                0.01,
+            normalized_error = float(
+                torch.sqrt(torch.mean((rebuilt_weight.float() - original_weight.float()) ** 2))
+                / original_weight.float().std()
             )
+            self.assertLess(normalized_error, 0.03)
 
 
 if __name__ == "__main__":
