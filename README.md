@@ -375,7 +375,7 @@ O relatório `neuron_similarity_report.json` conta pares nos quais **todos os tr
 
 ## Análise funcional de neurônios por ativações reais
 
-`analyze_neuron_activations.py` complementa a comparação de pesos: carrega o modelo local, executa **um único forward** com um texto de calibração, captura as ativações de `gate_proj` e `up_proj` na camada escolhida e calcula a ativação gated de cada neurônio. Então procura pares com traços de ativação correlacionados e estima o erro de saída se a contribuição de um neurônio for fundida no outro, ajustando a coluna correspondente de `down_proj`.
+`analyze_neuron_activations.py` complementa a comparação de pesos: carrega o checkpoint com `device_map="auto"`, executa o forward somente até a MLP escolhida e interrompe ali, sem calcular as camadas seguintes. Captura as ativações de `gate_proj` e `up_proj` e calcula a ativação gated de cada neurônio. Então procura pares com traços de ativação correlacionados e estima o erro de saída se a contribuição de um neurônio for fundida no outro, ajustando a coluna correspondente de `down_proj`.
 
 ```powershell
 # Analisar a camada 0 com um único texto de calibração
@@ -387,4 +387,4 @@ O relatório `neuron_similarity_report.json` conta pares nos quais **todos os tr
 
 O arquivo `neuron_activation_report.json` registra quantos pares têm correlação absoluta de ativação acima de 0,90, 0,95, 0,98 e 0,99, além dos melhores pares. Para cada candidato, estima o erro na contribuição combinada dos dois neurônios e uma estimativa do erro relativo perante a saída total da MLP se um fosse absorvido no outro.
 
-Essa é uma aproximação funcional melhor que comparar apenas os pesos, mas os resultados dependem do texto usado. Um único texto serve para filtrar candidatos; antes de podar, seria necessário confirmar os melhores pares em mais entradas. O script apenas analisa e não modifica o checkpoint.
+Embora as camadas posteriores não sejam executadas, `from_pretrained` ainda inicializa/encaminha o checkpoint inteiro e pode descarregar pesos em CPU/disco; portanto, o carregamento inicial ainda custa tempo. A interrupção reduz o cálculo do forward. Essa é uma aproximação funcional melhor que comparar apenas os pesos, mas os resultados dependem do texto usado. Um único texto serve para filtrar candidatos; antes de podar, seria necessário confirmar os melhores pares em mais entradas. O script apenas analisa e não modifica o checkpoint.
