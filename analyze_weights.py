@@ -280,7 +280,9 @@ def main() -> int:
                     original_dtype = str(block.dtype).replace("torch.", "").upper()
                     if original_dtype in ("BFLOAT16", "FLOAT16"):
                         dtype_key = "BF16" if original_dtype == "BFLOAT16" else "F16"
-                        hist = bit_histograms.setdefault(dtype_key, np.zeros(65536, dtype=np.uint64))
+                        if dtype_key not in bit_histograms:
+                            bit_histograms[dtype_key] = np.zeros(65536, dtype=np.uint64)
+                        hist = bit_histograms[dtype_key]
                         bits = torch_dtype_to_bits_tensor(block)
                         if bits is not None:
                             hist += np.bincount(bits.astype(np.int64, copy=False), minlength=65536).astype(np.uint64)
