@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import traceback
+from importlib import metadata
 from pathlib import Path
 
 
@@ -33,11 +35,29 @@ def main() -> int:
     try:
         import torch
         import transformers
-        from transformers import AutoProcessor
     except Exception as error:
         print("[ERRO] Falha ao importar PyTorch ou Transformers.", file=sys.stderr)
-        print("Execute: python -m pip install -U torch transformers accelerate", file=sys.stderr)
         print(f"Detalhe: {type(error).__name__}: {error}", file=sys.stderr)
+        traceback.print_exception(error)
+        return 3
+
+    def package_version(name: str) -> str:
+        try:
+            return metadata.version(name)
+        except metadata.PackageNotFoundError:
+            return "não instalado"
+
+    # AutoProcessor is a lazy import in Transformers. Its short error message
+    # can hide the dependency failure (often an incompatible torchvision build).
+    try:
+        AutoProcessor = getattr(transformers, "AutoProcessor")
+    except Exception as error:
+        print("[ERRO] A importação de AutoProcessor falhou; abaixo está a causa original.", file=sys.stderr)
+        print(f"Python: {sys.version.split()[0]}", file=sys.stderr)
+        for package in ("torch", "torchvision", "torchaudio", "transformers", "accelerate", "huggingface-hub"):
+            print(f"{package}: {package_version(package)}", file=sys.stderr)
+        print(f"CUDA visível pelo PyTorch: {getattr(torch.version, 'cuda', None)}", file=sys.stderr)
+        traceback.print_exception(error)
         return 3
 
     # Try the current Qwen3.5 API, then the compatible image-text-to-text alias.
