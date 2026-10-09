@@ -257,13 +257,19 @@ O decodificador recria os tensores no dtype original e divide a saída em shards
 
 ## Teste mínimo de resposta do checkpoint reconstruído
 
-Para o teste pedido — apenas confirmar que o modelo carrega e consegue responder — use `smoke_test_model.py`. Ele faz **uma única geração curta**, sem suíte de prompts nem benchmark.
+Para confirmar apenas que o modelo carrega e responde, `smoke_test_model.py` faz uma única geração curta. Não atualize o PyTorch isoladamente: `torch`, `torchvision` e `torchaudio` precisam ter versões compatíveis. Para uma GTX 1050 Ti (arquitetura Pascal), prefira a distribuição CUDA 12.6; as distribuições CUDA 13.x mais recentes deixaram de incluir suporte a algumas arquiteturas antigas.
 
-```bash
-python -m pip install -U torch transformers accelerate
-python smoke_test_model.py --model ./Qwen3.5-4B-log256-s075
+No Windows/PowerShell, crie um ambiente isolado para não alterar as dependências dos outros projetos:
+
+```powershell
+py -3.11 -m venv .venv-smoke
+.\.venv-smoke\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-smoke\Scripts\python.exe -m pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu126
+.\.venv-smoke\Scripts\python.exe -m pip install -U transformers accelerate huggingface_hub
+.\.venv-smoke\Scripts\python.exe -m pip check
+.\.venv-smoke\Scripts\python.exe smoke_test_model.py --model ".\Qwen3.5-4B-log256-s075"
 ```
 
-Por padrão, usa FP16 durante a inferência e `device_map="auto"`, que pode distribuir camadas entre GPU e CPU quando a VRAM não é suficiente. O checkpoint armazenado continua em BF16; o FP16 é somente o dtype usado neste teste de execução.
+O script usa FP16 por padrão e `device_map="auto"`, que pode distribuir camadas entre a GPU e a CPU. O checkpoint em disco permanece no dtype reconstruído. Se a importação de um componente do Transformers falhar, o script exibe as versões instaladas e o traceback completo, em vez de somente a mensagem superficial do importador.
 
-O script tenta primeiro `AutoModelForMultimodalLM` e, como alternativa, `AutoModelForImageTextToText`, usado nas APIs do Transformers para modelos imagem-texto. Se nenhuma classe puder ser carregada, mostra a versão do Transformers e os dois erros de importação. O teste imprime a resposta e termina com `[PASS]` se produzir texto não vazio; isso verifica somente carregamento e geração básica, não qualidade equivalente à do modelo original.
+O teste termina com `[PASS]` se o modelo produzir texto não vazio. Isso comprova apenas carregamento e geração básica, não equivalência de qualidade com o modelo original.
