@@ -200,6 +200,31 @@ def sample_weights(x: np.ndarray, sample_size: int, seed: int) -> np.ndarray:
     return x[chosen]
 
 
+def decode_artifact(path: Path, method: str) -> np.ndarray:
+    """Reload the saved NPZ and reconstruct from its stored arrays and metadata."""
+    with np.load(path, allow_pickle=False) as archive:
+        metadata = json.loads(archive["metadata"].tobytes().decode("utf-8"))
+        params = metadata["formula_parameters"]
+        if method == "baseline_kmeans":
+            centers = archive["centers_fp32"].astype(np.float32)
+            indices = archive["indices"].astype(np.int64)
+            return centers[indices]
+        if method == "formula_arithmetic_levels":
+            indices = archive["indices"].astype(np.float32)
+            stored = archive["parameters_fp32"].astype(np.float32)
+            return (stored[0] + indices * stored[1]).astype(np.float32)
+        if method == "formula_log_companding":
+            stored = archive["parameters_fp32"].astype(np.float32)
+            decode_params = {
+                "scale": float(stored[0]),
+                "zmax": float(stored[1]),
+                "levels": int(params["levels"]),
+            }
+            return log_compand_reconstruct(archive["indices"], decode_params)
+        coeffs = archive["block_coefficients"].copy()
+    return reconstruct_polynomial_blocks(coeffs, params)
+
+
 def run_experiment(
     name: str,
     x: np.ndarray,
@@ -208,7 +233,6 @@ def run_experiment(
     outdir: Path,
     params: dict[str, Any],
     arrays: dict[str, np.ndarray],
-    reconstructed: np.ndarray,
     batch: int,
     seed: int,
 ) -> dict[str, Any]:
@@ -223,9 +247,10 @@ def run_experiment(
         "reconstruction": "decoded from formula and stored parameter arrays",
     }
     size = write_artifact(artifact_path, arrays, meta)
-    # Metrics are computed on the exact values reconstructed from stored parameters.
-    metrics = weight_metrics(x, reconstructed)
-    projection = projection_probe(x, reconstructed, shape, batch, seed)
+    # Reload the actual NPZ before decoding, to validate the stored representation.
+    decoded = decode_artifact(artifact_path, name)
+    metrics = weight_metrics(x, decoded)
+    projection = projection_probe(x, decoded, shape, batch, seed)
     result = {
         "method": name,
         "artifact_path": str(artifact_path.resolve()),
@@ -292,39 +317,35 @@ def main() -> int:
     # Reference: learned K-means representatives and one symbol/index per weight.
     centers = np.sort(base.weighted_kmeans_1d(sample, args.levels))
     indices = base.assign_indices(x, centers, chunk_size=2_000_000)
-    k_recon = centers[indices.astype(np.int64)]
     k_result = run_experiment(
         "baseline_kmeans", x, original_shape, source_bytes, outdir,
         {"levels_requested": args.levels, "actual_centers": int(centers.size), "index_per_weight": True},
         {"centers_fp32": centers.astype(np.float32), "indices": indices},
-        k_recon, args.projection_batch, args.seed,
+        args.projection_batch, args.seed,
     )
     results.append(k_result)
 
     # Formula 1: arithmetic progression, no stored codebook.
     q_linear, p_linear = uniform_quantize(x, args.levels)
-    linear_recon = uniform_reconstruct(q_linear, p_linear)
     p_linear = {**p_linear, "formula": "value_i = minimum + index_i * step", "index_per_weight": True}
     results.append(run_experiment(
         "formula_arithmetic_levels", x, original_shape, source_bytes, outdir, p_linear,
         {"indices": q_linear, "parameters_fp32": np.array([p_linear["minimum"], p_linear["step"]], dtype=np.float32)},
-        linear_recon, args.projection_batch, args.seed,
+        args.projection_batch, args.seed,
     ))
 
     # Formula 2: nonlinear signed logarithmic companding, also with no stored codebook.
     q_log, p_log = log_compand_quantize(x, args.levels)
-    log_recon = log_compand_reconstruct(q_log, p_log)
     p_log = {**p_log, "formula": "z=sign(w)*log(1+abs(w)/scale); w'=sign(z')*scale*(exp(abs(z'))-1)", "index_per_weight": True}
     results.append(run_experiment(
         "formula_log_companding", x, original_shape, source_bytes, outdir, p_log,
         {"indices": q_log, "parameters_fp32": np.array([p_log["scale"], p_log["zmax"]], dtype=np.float32)},
-        log_recon, args.projection_batch, args.seed,
+        args.projection_batch, args.seed,
     ))
 
     # Formula 3: two coefficients per block.
     for degree, name in ((1, "formula_block_linear"), (3, "formula_block_cubic")):
         coeffs, p_poly = fit_polynomial_blocks(x, args.block_size, degree, args.coefficient_dtype)
-        poly_recon = reconstruct_polynomial_blocks(coeffs, p_poly)
         params = {
             **p_poly,
             "formula": "w_i = a0 + a1*t + ... + a_degree*t^degree; t in [-1,1] per block",
@@ -335,7 +356,7 @@ def main() -> int:
         results.append(run_experiment(
             name, x, original_shape, source_bytes, outdir, params,
             {"block_coefficients": coeffs},
-            poly_recon, args.projection_batch, args.seed,
+            args.projection_batch, args.seed,
         ))
 
     summary = {
