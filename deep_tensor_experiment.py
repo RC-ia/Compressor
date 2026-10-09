@@ -313,8 +313,6 @@ def main() -> int:
     ):
         if any(v < 2 or v > 65536 for v in values):
             parser.error(f"--{label} aceita valores entre 2 e 65536")
-    if any(v > 65536 for v in args.kmeans_samples):
-        parser.error("--kmeans-samples representa contagens de amostras; máximo permitido nesta versão: 65536")
     if args.oversample < 0 or args.power_iterations < 0:
         parser.error("--oversample e --power-iterations não podem ser negativos")
 
