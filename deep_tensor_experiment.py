@@ -490,7 +490,7 @@ def main() -> int:
                  "residual_groups_actual": int(centers.size), "index_bits": bits,
                  "factor_dtype": "fp16", "residual_codebook_dtype": "fp32",
                  "oversample": int(args.oversample), "power_iterations": int(args.power_iterations)},
-                x, source_bytes, shape, args.projection_batch, args.seed,
+                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats,
             ))
 
     results.sort(key=lambda item: (item["full_tensor_error"]["rmse_over_weight_std"], item["artifact_bytes_actual"]))
