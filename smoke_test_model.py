@@ -130,9 +130,9 @@ def main() -> int:
         else:
             print("[AVISO] O tokenizer local não possui chat_template; usando os tokens de conversa Qwen.", flush=True)
             formatted_prompt = (
-                "<|im_start|>user\\n"
+                "<|im_start|>user\n"
                 + args.prompt
-                + "<|im_end|>\\n<|im_start|>assistant\\n<think>\\n"
+                + "<|im_end|>\n<|im_start|>assistant\n<think>\n"
             )
             inputs = tokenizer(formatted_prompt, return_tensors="pt")
 
