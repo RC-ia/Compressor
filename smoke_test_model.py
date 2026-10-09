@@ -32,11 +32,31 @@ def main() -> int:
 
     try:
         import torch
-        from transformers import AutoModelForMultimodalLM, AutoProcessor
+        import transformers
+        from transformers import AutoProcessor
     except Exception as error:
-        print("[ERRO] Não consegui importar PyTorch/Transformers ou AutoModelForMultimodalLM.", file=sys.stderr)
-        print("Atualize o ambiente com: pip install -U transformers accelerate", file=sys.stderr)
+        print("[ERRO] Falha ao importar PyTorch ou Transformers.", file=sys.stderr)
+        print("Execute: python -m pip install -U torch transformers accelerate", file=sys.stderr)
         print(f"Detalhe: {type(error).__name__}: {error}", file=sys.stderr)
+        return 3
+
+    # Try the current Qwen3.5 API, then the compatible image-text-to-text alias.
+    model_loader = None
+    loader_errors = []
+    for loader_name in ("AutoModelForMultimodalLM", "AutoModelForImageTextToText"):
+        try:
+            model_loader = getattr(transformers, loader_name)
+            print(f"Classe de carregamento: {loader_name}", flush=True)
+            break
+        except Exception as error:
+            loader_errors.append((loader_name, error))
+
+    if model_loader is None:
+        print("[ERRO] Nenhuma classe de carregamento multimodal compatível pôde ser importada.", file=sys.stderr)
+        print(f"Versão do Transformers: {getattr(transformers, '__version__', 'desconhecida')}", file=sys.stderr)
+        print("Execute: python -m pip install -U transformers accelerate", file=sys.stderr)
+        for loader_name, error in loader_errors:
+            print(f"  {loader_name}: {type(error).__name__}: {error}", file=sys.stderr)
         return 3
 
     dtype = {
@@ -49,7 +69,7 @@ def main() -> int:
     try:
         processor = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
         print(f"[2/3] Carregando modelo (dtype={args.dtype}, device_map={args.device_map})...", flush=True)
-        model = AutoModelForMultimodalLM.from_pretrained(
+        model = model_loader.from_pretrained(
             str(model_dir),
             torch_dtype=dtype,
             device_map=args.device_map,
