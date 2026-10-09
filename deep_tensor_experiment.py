@@ -123,8 +123,15 @@ def decode_from_archive(path: Path, method: str) -> np.ndarray:
         numel = int(meta["numel"])
         kind = meta["kind"]
         if kind in ("kmeans", "uniform", "log", "hybrid"):
-            packed = archive["packed_indices"].astype(np.uint8, copy=False)
-            index = base.unpack_indices_bitplanes(packed, numel, int(meta["index_bits"]))
+            if meta.get("index_encoding") == "zlib_symbols":
+                raw = zlib.decompress(archive["zlib_indices"].astype(np.uint8, copy=False).tobytes())
+                index_dtype = np.dtype(meta["index_storage_dtype"])
+                index = np.frombuffer(raw, dtype=index_dtype, count=numel).astype(np.uint32)
+                if index.size != numel:
+                    raise ValueError(f"Mapa zlib inválido em {method}: quantidade de índices divergente")
+            else:
+                packed = archive["packed_indices"].astype(np.uint8, copy=False)
+                index = base.unpack_indices_bitplanes(packed, numel, int(meta["index_bits"]))
             if kind == "kmeans":
                 centers = archive["codebook"].astype(np.float32)
                 return centers[index.astype(np.int64)]
@@ -295,17 +302,81 @@ def save_and_measure(
     projection_batch: int,
     seed: int,
     timing_repeats: int = 5,
+    map_codec: str = "auto",
 ) -> dict[str, Any]:
+    """Write actual archives with a shared set of index codecs and select the smallest."""
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
     path = outdir / f"{safe}.npz"
-    meta = dict(metadata)
-    meta.update({"method": name, "kind": kind, "shape": list(shape), "numel": int(original.size)})
+    base_meta = dict(metadata)
+    base_meta.update({"method": name, "kind": kind, "shape": list(shape), "numel": int(original.size)})
     arrays = dict(arrays)
-    arrays["metadata"] = np.frombuffer(
-        json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-        dtype=np.uint8,
+    raw_indices = arrays.pop("raw_indices", None)
+    arrays.pop("packed_indices", None)
+    candidate_sizes: dict[str, int] = {}
+    candidate_paths: dict[str, Path] = {}
+    candidate_codecs = (
+        ["zip_deflate_bitplanes", "zlib_symbols", "raw_bitplanes"]
+        if map_codec == "auto" else [map_codec]
     )
-    np.savez_compressed(path, **arrays)
+
+    def metadata_bytes(meta: dict[str, Any]) -> np.ndarray:
+        return np.frombuffer(
+            json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            dtype=np.uint8,
+        )
+
+    if raw_indices is None:
+        # Low-rank-only candidates have no index map; only normal NPZ/Deflate applies.
+        base_meta["map_codec"] = "npz_deflate_no_index_map"
+        full = dict(arrays)
+        full["metadata"] = metadata_bytes(base_meta)
+        np.savez_compressed(path, **full)
+        candidate_sizes["npz_deflate_no_index_map"] = path.stat().st_size
+        selected_codec = "npz_deflate_no_index_map"
+        selected_meta = base_meta
+    else:
+        raw_indices = np.asarray(raw_indices).reshape(-1)
+        bits = int(base_meta.get("index_bits", 0))
+        packed = base.pack_indices_bitplanes(raw_indices, bits)
+        max_index = int(raw_indices.max()) if raw_indices.size else 0
+        symbol_dtype = np.dtype("<u1" if max_index <= 255 else "<u2" if max_index <= 65535 else "<u4")
+        symbol_bytes = raw_indices.astype(symbol_dtype, copy=False).tobytes()
+
+        for codec in candidate_codecs:
+            candidate_path = outdir / f".{safe}.{codec}.candidate.npz"
+            candidate_meta = dict(base_meta)
+            candidate_arrays = dict(arrays)
+            if codec in ("zip_deflate_bitplanes", "raw_bitplanes"):
+                candidate_meta["index_encoding"] = "bitplanes"
+                candidate_meta["index_storage_dtype"] = "packed_bits"
+                candidate_meta["map_codec"] = codec
+                candidate_arrays["packed_indices"] = packed
+                candidate_arrays["metadata"] = metadata_bytes(candidate_meta)
+                if codec == "zip_deflate_bitplanes":
+                    np.savez_compressed(candidate_path, **candidate_arrays)
+                else:
+                    np.savez(candidate_path, **candidate_arrays)
+            elif codec == "zlib_symbols":
+                compressed_symbols = zlib.compress(symbol_bytes, level=9)
+                candidate_meta["index_encoding"] = "zlib_symbols"
+                candidate_meta["index_storage_dtype"] = symbol_dtype.str
+                candidate_meta["map_codec"] = codec
+                candidate_arrays["zlib_indices"] = np.frombuffer(compressed_symbols, dtype=np.uint8)
+                candidate_arrays["metadata"] = metadata_bytes(candidate_meta)
+                np.savez(candidate_path, **candidate_arrays)
+            else:
+                raise ValueError(f"Codificador de índices desconhecido: {codec}")
+            candidate_paths[codec] = candidate_path
+            candidate_sizes[codec] = candidate_path.stat().st_size
+
+        selected_codec = min(candidate_sizes, key=candidate_sizes.get)
+        candidate_paths[selected_codec].replace(path)
+        selected_meta = dict(base_meta)
+        selected_meta["map_codec"] = selected_codec
+        for temp_path in candidate_paths.values():
+            if temp_path.exists():
+                temp_path.unlink()
+
     file_bytes = path.stat().st_size
     # Decode from the actual bytes on disk so metrics include storage dtype rounding.
     decode_started = time.perf_counter()
@@ -326,11 +397,13 @@ def save_and_measure(
         "source_tensor_bytes": int(source_bytes),
         "source_tensor_MB": source_bytes / 1_000_000,
         "savings_pct_vs_source": (1.0 - file_bytes / source_bytes) * 100.0 if source_bytes else 0.0,
+        "selected_map_codec": selected_codec,
+        "candidate_codec_sizes_bytes": candidate_sizes,
         "full_tensor_error": metrics,
         "linear_projection_probe": projection,
         "archive_decode_seconds_offline": decode_seconds,
         "direct_factorized_projection_benchmark": direct_factorized,
-        "metadata": {k: v for k, v in meta.items() if k not in ("shape", "numel", "kind", "method")},
+        "metadata": {k: v for k, v in selected_meta.items() if k not in ("shape", "numel", "kind", "method")},
     }
     (outdir / f"{safe}_report.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -371,13 +444,14 @@ def main() -> int:
     parser.add_argument("--kmeans-groups", type=parse_int_list, default=parse_int_list("64,256"))
     parser.add_argument("--residual-sample-size", type=int, default=500_000, help="Amostra para treinar codebooks dos resíduos híbridos")
     parser.add_argument("--log-levels", type=parse_int_list, default=parse_int_list("64,128,256,512"))
-    parser.add_argument("--log-scales", type=parse_float_list, default=parse_float_list("0.25,0.5,1,2,4"))
+    parser.add_argument("--log-scales", type=parse_float_list, default=parse_float_list("0.25,0.5,0.75,1"))
     parser.add_argument("--ranks", type=parse_int_list, default=parse_int_list("32,64,128,256,512"))
-    parser.add_argument("--hybrid-ranks", type=parse_int_list, default=parse_int_list("32,64,128"))
-    parser.add_argument("--residual-groups", type=parse_int_list, default=parse_int_list("16,64,256"))
+    parser.add_argument("--hybrid-ranks", type=parse_int_list, default=parse_int_list("64,128"))
+    parser.add_argument("--residual-groups", type=parse_int_list, default=parse_int_list("16,32,64"))
     parser.add_argument("--oversample", type=int, default=32)
     parser.add_argument("--power-iterations", type=int, default=2)
     parser.add_argument("--projection-batch", type=int, default=4)
+    parser.add_argument("--map-codec", choices=["auto", "zip_deflate_bitplanes", "zlib_symbols", "raw_bitplanes"], default="auto", help="Auto mede o tamanho real de três codificadores compartilhados entre K-means, log e híbridos")
     parser.add_argument("--timing-repeats", type=int, default=5, help="Repetições para benchmark NumPy da projeção fatorada")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -415,14 +489,14 @@ def main() -> int:
             sample = x[selected_positions[:sample_count]]
             centers = np.sort(base.weighted_kmeans_1d(sample, groups))
             indices = base.assign_indices(x, centers, chunk_size=2_000_000)
-            packed, bits = pack_indices(indices, int(centers.size))
+            bits = int(math.ceil(math.log2(int(centers.size)))) if centers.size > 1 else 0
             results.append(save_and_measure(
                 outdir, name, "kmeans",
-                {"codebook": centers.astype(np.float32), "packed_indices": packed},
+                {"codebook": centers.astype(np.float32), "raw_indices": indices},
                 {"requested_sample_count": int(sample_count), "requested_groups": int(groups),
                  "actual_groups": int(centers.size), "index_bits": bits,
                  "training_seed": int(args.seed)},
-                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats,
+                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats, args.map_codec,
             ))
 
     # B. Formula-generated signed log codebook across levels and characteristic scales.
@@ -430,13 +504,13 @@ def main() -> int:
         for scale_multiplier in args.log_scales:
             name = f"log_levels{levels}_scale{scale_multiplier:g}"
             indices, params = make_log_indices(x, levels, scale_multiplier)
-            packed, bits = pack_indices(indices, levels)
+            bits = int(math.ceil(math.log2(levels))) if levels > 1 else 0
             params_array = np.array([params["scale"], params["zmax"]], dtype=np.float32)
             results.append(save_and_measure(
                 outdir, name, "log",
-                {"packed_indices": packed, "formula_parameters": params_array},
+                {"raw_indices": indices, "formula_parameters": params_array},
                 {"levels": int(levels), "index_bits": bits, **params},
-                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats,
+                x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats, args.map_codec,
             ))
 
     # C. One randomized SVD basis, reused at all requested ranks.
@@ -467,7 +541,7 @@ def main() -> int:
             {"rank": int(rank), "factor_dtype": "fp16", "oversample": int(args.oversample),
              "power_iterations": int(args.power_iterations),
              "factor_parameter_bytes": int(left.nbytes + right.nbytes)},
-            x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats,
+            x, source_bytes, shape, args.projection_batch, args.seed, args.timing_repeats, args.map_codec,
         ))
 
     # D. Hybrid: low-rank structure plus quantized residual, retaining no per-weight FP16 values.
@@ -481,11 +555,11 @@ def main() -> int:
             name = f"hybrid_r{rank}_residual_g{groups}"
             centers = np.sort(base.weighted_kmeans_1d(residual_sample, groups))
             indices = base.assign_indices(residual, centers, chunk_size=2_000_000)
-            packed, bits = pack_indices(indices, int(centers.size))
+            bits = int(math.ceil(math.log2(int(centers.size)))) if centers.size > 1 else 0
             results.append(save_and_measure(
                 outdir, name, "hybrid",
                 {"left": left, "right": right, "residual_codebook": centers.astype(np.float32),
-                 "packed_indices": packed},
+                 "raw_indices": indices},
                 {"rank": int(rank), "residual_groups_requested": int(groups),
                  "residual_groups_actual": int(centers.size), "index_bits": bits,
                  "factor_dtype": "fp16", "residual_codebook_dtype": "fp32",
@@ -507,6 +581,7 @@ def main() -> int:
             "kmeans_samples": args.kmeans_samples, "kmeans_groups": args.kmeans_groups,
             "log_levels": args.log_levels, "log_scales": args.log_scales, "ranks": args.ranks,
             "hybrid_ranks": args.hybrid_ranks, "residual_groups": args.residual_groups,
+            "map_codec": args.map_codec,
             "residual_sample_size": args.residual_sample_size,
             "oversample": args.oversample, "power_iterations": args.power_iterations,
         },
@@ -525,12 +600,12 @@ def main() -> int:
     csv_path = outdir / "deep_comparison.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["method", "artifact_MB", "savings_pct", "rmse_over_std", "weight_cosine", "W@X_relative_error", "offline_decode_seconds", "direct_factorized_ms", "dense_over_factorized_ratio"])
+        writer.writerow(["method", "artifact_MB", "savings_pct", "map_codec", "rmse_over_std", "weight_cosine", "W@X_relative_error", "offline_decode_seconds", "direct_factorized_ms", "dense_over_factorized_ratio"])
         for item in results:
             probe = item["linear_projection_probe"]
             writer.writerow([
                 item["method"], f"{item['artifact_MB_actual']:.6f}",
-                f"{item['savings_pct_vs_source']:.4f}",
+                f"{item['savings_pct_vs_source']:.4f}", item["selected_map_codec"],
                 f"{item['full_tensor_error']['rmse_over_weight_std']:.8f}",
                 f"{item['full_tensor_error']['cosine_similarity_flat_weights']:.8f}",
                 "" if probe is None else f"{probe['output_rmse_over_original_rms']:.8f}",
