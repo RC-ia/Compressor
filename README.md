@@ -270,6 +270,6 @@ py -3.11 -m venv .venv-smoke
 .\.venv-smoke\Scripts\python.exe smoke_test_model.py --model ".\Qwen3.5-4B-log256-s075"
 ```
 
-O script usa FP16 por padrão e `device_map="auto"`, que pode distribuir camadas entre a GPU e a CPU. O checkpoint em disco permanece no dtype reconstruído. Se a importação de um componente do Transformers falhar, o script exibe as versões instaladas e o traceback completo, em vez de somente a mensagem superficial do importador.
+O script usa FP16 por padrão e `device_map="auto"`, que pode distribuir camadas entre a GPU e a CPU. O checkpoint em disco permanece no dtype reconstruído. Se a importação de um componente do Transformers falhar, o script exibe as versões instaladas e o traceback completo. Se o processador/tokenizer reconstruído não tiver `chat_template`, ele usa o formato de conversa textual Qwen (`<|im_start|>`, `<|im_end|>` e prefixo `<think>`) para fazer o teste mínimo; também considera que parte dos pesos pode estar descarregada em CPU/disco.
 
 O teste termina com `[PASS]` se o modelo produzir texto não vazio. Isso comprova apenas carregamento e geração básica, não equivalência de qualidade com o modelo original.
