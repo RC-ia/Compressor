@@ -314,6 +314,7 @@ def save_and_measure(
     arrays.pop("packed_indices", None)
     candidate_sizes: dict[str, int] = {}
     candidate_paths: dict[str, Path] = {}
+    candidate_metas: dict[str, dict[str, Any]] = {}
     candidate_codecs = (
         ["zip_deflate_bitplanes", "zlib_symbols", "raw_bitplanes"]
         if map_codec == "auto" else [map_codec]
@@ -368,11 +369,11 @@ def save_and_measure(
                 raise ValueError(f"Codificador de índices desconhecido: {codec}")
             candidate_paths[codec] = candidate_path
             candidate_sizes[codec] = candidate_path.stat().st_size
+            candidate_metas[codec] = candidate_meta
 
         selected_codec = min(candidate_sizes, key=candidate_sizes.get)
         candidate_paths[selected_codec].replace(path)
-        selected_meta = dict(base_meta)
-        selected_meta["map_codec"] = selected_codec
+        selected_meta = candidate_metas[selected_codec]
         for temp_path in candidate_paths.values():
             if temp_path.exists():
                 temp_path.unlink()
@@ -451,7 +452,7 @@ def main() -> int:
     parser.add_argument("--oversample", type=int, default=32)
     parser.add_argument("--power-iterations", type=int, default=2)
     parser.add_argument("--projection-batch", type=int, default=4)
-    parser.add_argument("--map-codec", choices=["auto", "zip_deflate_bitplanes", "zlib_symbols", "raw_bitplanes"], default="auto", help="Auto mede o tamanho real de três codificadores compartilhados entre K-means, log e híbridos")
+    parser.add_argument("--map-codec", choices=["auto", "zip_deflate_bitplanes", "zlib_symbols", "raw_bitplanes"], default="zlib_symbols", help="Usa zlib_symbols igualmente em todos os mapas por padrão; auto compara os três codificadores")
     parser.add_argument("--timing-repeats", type=int, default=5, help="Repetições para benchmark NumPy da projeção fatorada")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
