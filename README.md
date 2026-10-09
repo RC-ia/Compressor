@@ -202,13 +202,13 @@ python deep_tensor_experiment.py --model ./Qwen3.5-4B \
 
 ### Codificação de índices comparável
 
-Para K-means, quantização logarítmica e híbridos, o script mede o tamanho real usando o mesmo conjunto de codificadores: bitplanes com ZIP/DEFLATE, símbolos com zlib e bitplanes sem compressão. Por padrão, escolhe o menor arquivo medido e registra `selected_map_codec` e `candidate_codec_sizes_bytes` no relatório. Para obrigar todos os métodos a usar exatamente o mesmo codificador, passe `--map-codec zlib_symbols` (ou outra opção disponível).
+Para K-means, quantização logarítmica e híbridos, o script usa **zlib_symbols por padrão em todos os mapas**, garantindo a mesma codificação de índices durante a comparação. O relatório registra `selected_map_codec`. Para medir também os tamanhos alternativos — bitplanes com ZIP/DEFLATE, símbolos com zlib e bitplanes sem compressão — e selecionar o menor arquivo para cada método, passe `--map-codec auto`; o relatório então inclui `candidate_codec_sizes_bytes`.
 
 ```bash
-# Forçar o mesmo codificador de índices em toda a comparação
+# Comparar todos os codificadores e escolher o menor arquivo por método
 python deep_tensor_experiment.py --model ./Qwen3.5-4B \
   --tensor-name model.visual.merger.linear_fc1.weight \
-  --map-codec zlib_symbols --output-dir deep_tensor_zlib
+  --map-codec auto --output-dir deep_tensor_auto_codec
 ```
 
 Ajustes avançados podem ser feitos por `--kmeans-samples`, `--kmeans-groups`, `--log-levels`, `--log-scales`, `--ranks`, `--hybrid-ranks` e `--residual-groups`. Use `--timing-repeats` para controlar as repetições do benchmark exploratório de projeção fatorada.
