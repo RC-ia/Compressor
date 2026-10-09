@@ -260,10 +260,10 @@ O decodificador recria os tensores no dtype original e divide a saída em shards
 Para o teste pedido — apenas confirmar que o modelo carrega e consegue responder — use `smoke_test_model.py`. Ele faz **uma única geração curta**, sem suíte de prompts nem benchmark.
 
 ```bash
-pip install -U transformers accelerate
+python -m pip install -U torch transformers accelerate
 python smoke_test_model.py --model ./Qwen3.5-4B-log256-s075
 ```
 
 Por padrão, usa FP16 durante a inferência e `device_map="auto"`, que pode distribuir camadas entre GPU e CPU quando a VRAM não é suficiente. O checkpoint armazenado continua em BF16; o FP16 é somente o dtype usado neste teste de execução.
 
-O teste imprime a resposta e termina com `[PASS]` se produzir texto não vazio. Se falhar, imprime o tipo e a mensagem do erro; copie o traceback para diagnosticar a causa. Isso verifica somente carregamento e geração básica, não qualidade equivalente à do modelo original.
+O script tenta primeiro `AutoModelForMultimodalLM` e, como alternativa, `AutoModelForImageTextToText`, usado nas APIs do Transformers para modelos imagem-texto. Se nenhuma classe puder ser carregada, mostra a versão do Transformers e os dois erros de importação. O teste imprime a resposta e termina com `[PASS]` se produzir texto não vazio; isso verifica somente carregamento e geração básica, não qualidade equivalente à do modelo original.
