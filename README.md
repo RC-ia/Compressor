@@ -218,3 +218,38 @@ O relatório `deep_comparison.json` contém as configurações, tamanho real do 
 Para candidatos de baixo posto, o script também compara `U @ (V.T @ X)` com `W @ X` denso usando NumPy FP32 na CPU, sem reconstruir a matriz (W) durante a multiplicação fatorada. Esse é um benchmark de operação matricial, não tokens por segundo do modelo e não uma previsão de velocidade na GPU.
 
 **Limitações:** randomized SVD é uma aproximação; mais `--oversample` e `--power-iterations` podem aumentar a precisão com custo de tempo. O teste W@X usa entrada sintética e não substitui a avaliação de logits, ativações reais ou perplexidade do modelo inteiro.
+
+
+## Codec de checkpoint completo
+
+`full_model_codec.py` aplica a fórmula logarítmica ao **checkpoint inteiro**, em vez de escolher uma única matriz. Ele processa todos os tensores Safetensors em blocos para limitar memória, usa 256 níveis e multiplicador de escala 0,75 por padrão, e estima uma escala por tensor a partir de uma amostra determinística. Tensores pequenos (até 256 elementos) e tensores não flutuantes são preservados sem perda.
+
+### Comprimir todos os pesos
+
+```bash
+python full_model_codec.py compress \
+  --model ./Qwen3.5-4B \
+  --output ./qwen3.5-4b-log256-s075.rccomp
+```
+
+O artefato `.rccomp` contém todos os tensores e um manifesto, num contêiner ZIP64. Cada fluxo de índices é comprimido com zlib e armazenado sem uma segunda camada de compressão. Após a gravação, o programa percorre os payloads para verificar seus comprimentos e hashes SHA-256. Use `--skip-verify` para pular essa leitura adicional caso precise reduzir o tempo de execução; nesse modo não haverá verificação integral dos payloads gravados.
+
+O relatório `qwen3.5-4b-log256-s075.rccomp.report.json` informa tamanho real do arquivo, redução frente aos bytes originais dos tensores, erro numérico agregado sobre todos os pesos flutuantes, contagem por tipo de representação e métricas individuais por tensor. O tamanho é medido depois da gravação, não estimado.
+
+### Reconstruir um checkpoint Safetensors para avaliar o modelo
+
+```bash
+python full_model_codec.py decode \
+  --archive ./qwen3.5-4b-log256-s075.rccomp \
+  --output-dir ./Qwen3.5-4B-log256-s075 \
+  --source-model ./Qwen3.5-4B
+```
+
+O decodificador recria os tensores no dtype original e divide a saída em shards Safetensors. Ele também copia os arquivos auxiliares do modelo (configuração, tokenizer e processador) a partir da pasta de origem. O checkpoint reconstruído pode então ser carregado pelo Transformers para verificar geração, logits ou perplexidade. Reserve espaço em disco para o arquivo comprimido e para o checkpoint reconstruído; a decodificação não altera o original.
+
+### Limites desta etapa
+
+- O formato `.rccomp` é um formato de pesquisa próprio e não pode ser carregado diretamente pelo Transformers.
+- A métrica agregada dos pesos não prova que a qualidade linguística foi preservada; a confirmação exige inferência ou perplexidade no checkpoint reconstruído.
+- A inferência ainda usa os pesos BF16 reconstruídos. Ganho de velocidade durante a geração exigirá um runtime/kernel que opere diretamente sobre o formato comprimido.
+- A escala por tensor é estimada por amostragem; a escala e o limite de transformação são registrados no manifesto para permitir reconstrução reproduzível.
