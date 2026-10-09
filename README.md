@@ -215,4 +215,6 @@ python deep_tensor_experiment.py --model ./Qwen3.5-4B \
 
 O relatório consolidado `deep_comparison.json` guarda configuração, tamanho efetivo, economia frente ao tensor original, erro de reconstrução e erro W@X para cada candidato. `deep_comparison.csv` facilita ordenar e comparar os resultados. Arquivos individuais NPZ e relatórios JSON também ficam no diretório de saída.
 
+O script separa **tempo de decodificação/reconstrução offline** de um **benchmark exploratório da projeção fatorada**. Para candidatos de baixo posto, mede `U @ (V.T @ X)` diretamente, sem materializar `W = U @ V.T` durante essa projeção, e compara o tempo com `W @ X` denso usando NumPy FP32 na CPU. Os tempos são apenas uma comparação local de operações matriciais: não são tokens/segundo de um LLM nem predizem a velocidade em GPU. Para ajustar o número de repetições, use `--timing-repeats 5`.
+
 **Cuidados de interpretação:** randomized SVD é uma aproximação, não uma SVD exata; aumente `--oversample` ou `--power-iterations` para estudar a precisão à custa de tempo. O ensaio W@X é sintético. Uma redução forte do arquivo ou um cosseno alto não substitui a validação de logits, ativações e perplexidade do modelo completo.
