@@ -214,7 +214,7 @@ def main() -> int:
     if std <= 0.0 or not math.isfinite(std):
         print("[ERRO] O tensor tem desvio-padrão inválido; não é possível normalizar.", file=sys.stderr)
         return 2
-    target_normalized = torch.from_numpy((original - mean) / std)
+    target_normalized = torch.from_numpy(np.asarray((original - mean) / std, dtype=np.float32))
     rows, cols = original.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = NonlinearWeightFormula(rows, cols, args.embedding_dim, args.hidden_dim).to(device)
