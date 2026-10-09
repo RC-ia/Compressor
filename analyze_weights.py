@@ -219,13 +219,14 @@ def weighted_1d_kmeans(
 
 
 def cast_codebook(centers: np.ndarray, dtype: str) -> np.ndarray:
-    """Round representatives to the requested storage dtype before validation."""
+    """Round representatives to the requested storage dtype and remove merged centers."""
     values = np.asarray(centers, dtype=np.float32)
     if dtype == "fp16":
-        return values.astype(np.float16).astype(np.float32)
-    if dtype == "bf16":
-        return torch.from_numpy(values.copy()).to(torch.bfloat16).float().numpy()
-    return values
+        values = values.astype(np.float16).astype(np.float32)
+    elif dtype == "bf16":
+        values = torch.from_numpy(values.copy()).to(torch.bfloat16).float().numpy()
+    # Low-precision rounding can merge two centroids. Do not pay index bits for duplicates.
+    return np.unique(values)
 
 
 def evaluate_codebook(centers: np.ndarray, values: np.ndarray) -> tuple[float, float, float, int]:
