@@ -346,3 +346,28 @@ Arquivos de saída:
 - `predictive_map_report.json`: tamanho do mapa direto e do mapa preditivo, entropia dos índices/resíduos, acerto do preditor, erro da reconstrução, e velocidade em milhões de índices por segundo.
 
 O mapa preditivo tem de ser decodificado **exatamente** para recuperar os índices; a aproximação numérica resulta apenas dos 16 representantes. Esse é um primeiro teste de referência, não uma micro-LLM: se a estrutura local já não reduzir o mapa de modo significativo ou ficar mais lenta, isso mede o obstáculo que um decodificador neural mais complexo teria de superar. O tamanho de uma tabela preditiva aprendida por matriz é contabilizado no artefato salvo.
+
+
+## Análise de neurônios MLP potencialmente redundantes
+
+`analyze_neuron_similarity.py` analisa uma camada MLP real procurando neurônios cujos três vetores de pesos sejam muito parecidos:
+- a linha de `gate_proj`;
+- a linha de `up_proj`;
+- a coluna correspondente de `down_proj`.
+
+O teste compara todos os pares por cosseno quando CUDA está disponível. Também verifica se as escalas são compatíveis e aceita que `up_proj` e `down_proj` tenham sinais invertidos ao mesmo tempo, pois esse padrão pode conservar a contribuição multiplicativa do ramo. Na CPU, por padrão usa uma amostra de 1.024 neurônios para evitar uma comparação quadrática demasiado lenta.
+
+```powershell
+# Usar o Python do ambiente isolado do teste anterior
+.\.venv-smoke\Scripts\python.exe analyze_neuron_similarity.py --model ".\Qwen3.5-4B" --layer-index 0 --output-dir neuron_similarity_results
+
+# Listar as camadas encontradas
+.\.venv-smoke\Scripts\python.exe analyze_neuron_similarity.py --model ".\Qwen3.5-4B" --list-layers
+
+# Na GPU, aumentar o bloco de comparação se houver memória disponível
+.\.venv-smoke\Scripts\python.exe analyze_neuron_similarity.py --model ".\Qwen3.5-4B" --layer-index 0 --batch-rows 128
+```
+
+O relatório `neuron_similarity_report.json` conta pares nos quais **todos os três vetores** ultrapassam os limiares de similaridade 0,90, 0,95, 0,98 e 0,99, respeitando também os filtros de escala/sinal. Salva ainda os melhores pares candidatos e os cossenos individuais.
+
+**Limitação importante:** este é um primeiro filtro baseado nos pesos, não uma prova de equivalência funcional. Para confirmar que dois neurônios são de fato substituíveis, seria necessário comparar suas ativações e contribuições usando entradas reais. O script não poda nem altera o checkpoint.
