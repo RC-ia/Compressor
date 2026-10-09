@@ -102,6 +102,52 @@ Campos que merecem atenção em `group_analysis.csv`:
 5. A reconstrução envolve lookup de representantes. O custo durante inferência e a compatibilidade com kernels de GPU/CPU precisam ser medidos separadamente; não está garantido que a execução fique mais rápida.
 6. O analisador não modifica nem regrava o checkpoint original.
 
+## Teste real de codificação e reconstrução de uma matriz
+
+O script `compress_tensor.py` passa da estimativa para um teste concreto: escolhe **um tensor real** do checkpoint, aprende o codebook a partir de uma amostra, atribui um índice a cada peso da matriz, empacota os índices, grava um artefato NPZ e lê esse artefato de volta para reconstruir e medir o tensor inteiro.
+
+Por padrão ele escolhe uma matriz bidimensional intermediária de até 20 milhões de pesos para evitar selecionar automaticamente uma matriz de embedding gigantesca. É possível escolher o tensor exato ou listar candidatos.
+
+```bash
+# Listar os maiores tensores no checkpoint local
+python compress_tensor.py --model ./Qwen3.5-4B --list-tensors
+
+# Codificar, decodificar e medir uma matriz com 256 representantes por tensor
+python compress_tensor.py --model ./Qwen3.5-4B \
+  --groups 256 --sample-size 250000 --codebook-dtype fp32
+
+# Escolher o nome exato informado por --list-tensors
+python compress_tensor.py --model ./Qwen3.5-4B \
+  --tensor-name 'model.layers.0.self_attn.q_proj.weight' \
+  --groups 256 --sample-size 250000 --codebook-dtype fp32
+
+# Comparar codebooks de baixa precisão
+python compress_tensor.py --model ./Qwen3.5-4B --groups 256 --codebook-dtype bf16
+python compress_tensor.py --model ./Qwen3.5-4B --groups 256 --codebook-dtype fp16
+
+# Também materializar o tensor reconstruído em Safetensors para inspeção
+python compress_tensor.py --model ./Qwen3.5-4B \
+  --groups 256 --save-reconstructed-safetensors
+```
+
+Resultados em `compressor_tensor_test/`:
+
+- `*.npz`: codebook e mapa de índices comprimidos de fato, sem guardar os pesos originais.
+- `*_report.json`: tamanho real do tensor-fonte, tamanho real do artefato no disco, economia observada, entropia/frequências dos índices, erro calculado sobre **todos** os pesos do tensor e teste (W X).
+
+O codificador compara três variantes reais e escolhe a que gerar o menor artefato: bitplanes empacotados com ZIP/DEFLATE; símbolos de índice com zlib e arquivo ZIP sem compressão externa; e bitplanes sem compressão. Isso mede se a distribuição dos índices oferece uma economia adicional. A entropia de ordem zero também é reportada como limite teórico baseado somente nas frequências.
+
+O teste (W X) usa entradas gaussianas sintéticas para conferir como o erro dos pesos afeta uma projeção linear; **não é uma avaliação de linguagem**. Ainda não há kernels customizados para inferência a partir desse formato, nem uma conversão do checkpoint inteiro. O arquivo NPZ é um formato experimental para medir tamanho e validar encoder/decoder, não é diretamente carregável por Transformers.
+
+## Testes locais
+
+```bash
+python -m py_compile analyze_weights.py compress_tensor.py
+python -m unittest discover -s tests -v
+```
+
+O teste unitário cria uma pequena matriz Safetensors sintética e verifica empacotamento/desempacotamento de índices, análise de entropia e round-trip do artefato em cada modo de codificação. Isso valida a mecânica do encoder/decoder, não substitui a execução no Qwen real.
+
 ## Próxima etapa experimental
 
-Escolher uma ou duas configurações com boa relação erro/tamanho, implementar encoder e decoder de verdade, reconstruir uma ou duas matrizes, verificar o erro diretamente em todos os seus pesos e comparar as saídas de camadas. Só depois avaliar o modelo completo com perplexidade/logits e inferência real.
+Executar `compress_tensor.py` no checkpoint local e comparar 16, 64, 256 e 512 representantes, com codebooks FP32 e BF16. Se o arquivo real ficar menor e o erro da projeção permanecer aceitável, o próximo teste é repetir por várias camadas e avaliar logits/perplexidade antes de gerar um checkpoint completo.
