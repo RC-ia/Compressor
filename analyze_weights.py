@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
 import time
 from collections import defaultdict
@@ -72,22 +73,60 @@ def is_float_dtype(name: str) -> bool:
     return name in FLOAT_DTYPES or name.startswith("F8_")
 
 
-def allocate_samples(tensors: list[dict[str, Any]], budget: int) -> dict[tuple[str, str], int]:
-    """Allocate a model-size-proportional sample, using largest remainders."""
+def allocate_samples(
+    tensors: list[dict[str, Any]], budget: int, min_per_tensor: int = 128
+) -> dict[tuple[str, str], int]:
+    """Stratified sampling: ensure tensor coverage, then allocate remaining budget by size."""
     total = sum(t["numel"] for t in tensors)
     if total == 0:
         return {}
-    budget = min(budget, total)
-    raw = [budget * t["numel"] / total for t in tensors]
-    alloc = [min(t["numel"], int(math.floor(v))) for t, v in zip(tensors, raw)]
-    remain = budget - sum(alloc)
-    order = sorted(range(len(tensors)), key=lambda i: raw[i] - math.floor(raw[i]), reverse=True)
-    for i in order:
-        if remain <= 0:
+    budget = min(max(1, budget), total)
+    sizes = [t["numel"] for t in tensors]
+
+    base = [min(n, max(1, int(min_per_tensor))) for n in sizes]
+    if sum(base) > budget:
+        # If the requested floor is impossible, revert to proportional sampling.
+        raw = [budget * n / total for n in sizes]
+        alloc = [min(n, int(math.floor(v))) for n, v in zip(sizes, raw)]
+        remain = budget - sum(alloc)
+        order = sorted(range(len(tensors)), key=lambda i: raw[i] - math.floor(raw[i]), reverse=True)
+        for i in order:
+            if remain <= 0:
+                break
+            if alloc[i] < sizes[i]:
+                alloc[i] += 1
+                remain -= 1
+        return {(t["file"], t["name"]): n for t, n in zip(tensors, alloc)}
+
+    alloc = base[:]
+    remaining = budget - sum(alloc)
+    while remaining > 0:
+        capacity = [n - a for n, a in zip(sizes, alloc)]
+        total_capacity = sum(capacity)
+        if total_capacity <= 0:
             break
-        if alloc[i] < tensors[i]["numel"]:
-            alloc[i] += 1
-            remain -= 1
+        raw = [remaining * c / total_capacity for c in capacity]
+        additions = [min(capacity[i], int(math.floor(raw[i]))) for i in range(len(alloc))]
+        used = sum(additions)
+        alloc = [a + b for a, b in zip(alloc, additions)]
+        remaining -= used
+        if remaining <= 0:
+            break
+        order = sorted(
+            (i for i, cap in enumerate(capacity) if alloc[i] < sizes[i]),
+            key=lambda i: raw[i] - math.floor(raw[i]),
+            reverse=True,
+        )
+        if not order:
+            break
+        for i in order:
+            if remaining <= 0:
+                break
+            if alloc[i] < sizes[i]:
+                alloc[i] += 1
+                remaining -= 1
+        if used == 0 and not order:
+            break
     return {(t["file"], t["name"]): n for t, n in zip(tensors, alloc)}
 
 
@@ -122,50 +161,115 @@ def chunk_iter(safe_file: Any, name: str, shape: tuple[int, ...], chunk_elements
         flat_offset += block.numel()
 
 
-def weighted_1d_kmeans(sample: np.ndarray, k: int, max_iter: int = 40) -> tuple[np.ndarray, float, float, float]:
-    """Lloyd k-means for 1D scalar weights; sample duplicates are frequency weights."""
-    x = np.asarray(sample, dtype=np.float64)
-    x = x[np.isfinite(x)]
+def weighted_1d_kmeans(
+    sample: np.ndarray,
+    k: int,
+    sample_weights: np.ndarray | None = None,
+    max_iter: int = 30,
+) -> tuple[np.ndarray, float, float, float]:
+    """Weighted scalar k-means; sample_weights lets stratified samples remain population-weighted."""
+    x = np.asarray(sample, dtype=np.float64).reshape(-1)
+    if sample_weights is None:
+        w = np.ones(x.size, dtype=np.float64)
+    else:
+        w = np.asarray(sample_weights, dtype=np.float64).reshape(-1)
+        if w.size != x.size:
+            raise ValueError("sample_weights deve ter o mesmo tamanho da amostra")
+    good = np.isfinite(x) & np.isfinite(w) & (w > 0)
+    x, w = x[good], w[good]
     if x.size == 0:
         raise ValueError("Amostra sem pesos finitos")
-    values, counts = np.unique(x, return_counts=True)
-    counts = counts.astype(np.float64)
-    k = min(int(k), len(values))
+    values, inverse = np.unique(x, return_inverse=True)
+    counts = np.bincount(inverse, weights=w, minlength=values.size).astype(np.float64)
+    k = max(1, min(int(k), values.size))
+
     if k == 1:
         centers = np.array([np.average(values, weights=counts)], dtype=np.float64)
     else:
+        # Start at evenly spaced ranks when weighted quantiles collide.
         cumulative = np.cumsum(counts)
         targets = (np.arange(k, dtype=np.float64) + 0.5) * cumulative[-1] / k
         idx = np.searchsorted(cumulative, targets, side="left")
-        centers = np.unique(values[np.minimum(idx, len(values) - 1)].astype(np.float64))
+        centers = np.unique(values[np.minimum(idx, values.size - 1)])
         if centers.size < k:
-            q = np.linspace(0, len(values) - 1, k).round().astype(int)
-            centers = np.unique(values[q]).astype(np.float64)
+            ranks = np.linspace(0, values.size - 1, k).round().astype(np.int64)
+            centers = values[ranks].copy()
 
     for _ in range(max_iter):
+        centers.sort()
         if centers.size <= 1:
             break
-        centers.sort()
         boundaries = (centers[:-1] + centers[1:]) / 2.0
         assignment = np.searchsorted(boundaries, values, side="right")
         cluster_weight = np.bincount(assignment, weights=counts, minlength=centers.size)
         cluster_sum = np.bincount(assignment, weights=counts * values, minlength=centers.size)
         nonempty = cluster_weight > 0
-        updated = centers.copy()
-        updated[nonempty] = cluster_sum[nonempty] / cluster_weight[nonempty]
-        updated = updated[nonempty]
+        updated = (cluster_sum[nonempty] / cluster_weight[nonempty])
         if updated.size == centers.size and np.allclose(updated, centers, rtol=1e-7, atol=1e-12):
             centers = updated
             break
         centers = updated
-
     centers.sort()
-    assignment = np.searchsorted((centers[:-1] + centers[1:]) / 2.0, values, side="right") if centers.size > 1 else np.zeros(values.size, dtype=np.int64)
+    boundaries = (centers[:-1] + centers[1:]) / 2.0
+    assignment = np.searchsorted(boundaries, values, side="right") if centers.size > 1 else np.zeros(values.size, dtype=np.int64)
     errors = values - centers[assignment]
     mse = float(np.average(errors * errors, weights=counts))
     mae = float(np.average(np.abs(errors), weights=counts))
-    rmse = math.sqrt(max(mse, 0.0))
-    return centers.astype(np.float32), mse, mae, rmse
+    return centers.astype(np.float32), mse, mae, math.sqrt(max(mse, 0.0))
+
+
+def cast_codebook(centers: np.ndarray, dtype: str) -> np.ndarray:
+    """Round representatives to the requested storage dtype before validation."""
+    values = np.asarray(centers, dtype=np.float32)
+    if dtype == "fp16":
+        return values.astype(np.float16).astype(np.float32)
+    if dtype == "bf16":
+        return torch.from_numpy(values.copy()).to(torch.bfloat16).float().numpy()
+    return values
+
+
+def evaluate_codebook(centers: np.ndarray, values: np.ndarray) -> tuple[float, float, float, int]:
+    """Return sample MSE, MAE, max-absolute-error, and sample count."""
+    x = np.asarray(values, dtype=np.float64).reshape(-1)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return 0.0, 0.0, 0.0, 0
+    c = np.sort(np.asarray(centers, dtype=np.float64))
+    if c.size == 1:
+        reconstructed = np.full(x.shape, c[0], dtype=np.float64)
+    else:
+        boundaries = (c[:-1] + c[1:]) / 2.0
+        indices = np.searchsorted(boundaries, x, side="right")
+        reconstructed = c[indices]
+    error = x - reconstructed
+    return (
+        float(np.mean(error * error)),
+        float(np.mean(np.abs(error))),
+        float(np.max(np.abs(error))),
+        int(x.size),
+    )
+
+
+def group_key_for_tensor(name: str, scope: str) -> str:
+    """Choose one shared codebook globally, per transformer layer, or per tensor."""
+    if scope == "global":
+        return "global"
+    if scope == "tensor":
+        return "tensor::" + name
+    # Share by layer index when a conventional layer/block naming pattern exists.
+    match = re.search(r"(?i)(?:^|\.)(?:layers|blocks|h|layer|block)\.(\d+)(?:\.|$)", name)
+    if match:
+        return "layer::" + name[:match.end()].rstrip(".")
+    # Embeddings, final norms, and other unindexed tensors remain isolated.
+    return "tensor::" + name
+
+
+def parse_scopes(raw: str) -> list[str]:
+    values = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    allowed = {"global", "layer", "tensor"}
+    if not values or any(x not in allowed for x in values):
+        raise argparse.ArgumentTypeError("Escopos válidos: global,layer,tensor")
+    return list(dict.fromkeys(values))
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
@@ -184,6 +288,10 @@ def main() -> int:
     parser.add_argument("--sample-size", type=int, default=150_000, help="Amostra proporcional ao número de pesos")
     parser.add_argument("--chunk-elements", type=int, default=1_000_000, help="Elementos máximos por bloco lido")
     parser.add_argument("--groups", type=parse_groups, default=DEFAULT_GROUPS, help="Grupos candidatos separados por vírgula")
+    parser.add_argument("--scopes", type=parse_scopes, default=["global", "layer", "tensor"], help="Codebook: global, layer, tensor")
+    parser.add_argument("--codebook-dtype", choices=["fp32", "fp16", "bf16"], default="fp32", help="Formato dos representantes, independente dos índices")
+    parser.add_argument("--validation-fraction", type=float, default=0.2, help="Fração da amostra reservada para validação (0.05-0.5)")
+    parser.add_argument("--min-samples-per-tensor", type=int, default=128, help="Amostras mínimas por tensor para evitar ignorar tensores pequenos")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -191,6 +299,10 @@ def main() -> int:
         parser.error("--sample-size precisa ser >= 1000 para produzir estatísticas úteis")
     if args.chunk_elements < 1:
         parser.error("--chunk-elements precisa ser positivo")
+    if not 0.05 <= args.validation_fraction <= 0.5:
+        parser.error("--validation-fraction deve ficar entre 0.05 e 0.5")
+    if args.min_samples_per_tensor < 1:
+        parser.error("--min-samples-per-tensor deve ser positivo")
 
     start_time = time.time()
     root = resolve_model(args.model, args.cache_dir, args.revision)
@@ -220,7 +332,7 @@ def main() -> int:
 
     total_params = sum(t["numel"] for t in tensors)
     total_bytes = sum(t["bytes"] for t in tensors)
-    sample_counts = allocate_samples(tensors, args.sample_size)
+    sample_counts = allocate_samples(tensors, args.sample_size, args.min_samples_per_tensor)
     rng = np.random.default_rng(args.seed)
     sample_indices: dict[tuple[str, str], np.ndarray] = {}
     for t in tensors:
@@ -236,6 +348,7 @@ def main() -> int:
     float32_pattern_cap = 5_000_000
     float32_patterns_exact = True
     tensor_stats: list[dict[str, Any]] = []
+    tensor_samples: dict[tuple[str, str], np.ndarray] = {}
     sample_parts: list[np.ndarray] = []
     scanned = 0
     started_scan = time.time()
@@ -314,6 +427,7 @@ def main() -> int:
                 else:
                     mean, std, minimum, maximum = 0.0, 0.0, 0.0, 0.0
                 t_sample = np.concatenate(t_sample_parts) if t_sample_parts else np.empty(0, dtype=np.float32)
+                tensor_samples[key] = t_sample
                 tensor_stats.append({
                     "tensor": t["name"], "file": file_path.name, "dtype": t["dtype"],
                     "shape": t["shape_text"], "numel": n, "estimated_bytes": t["bytes"],
@@ -332,28 +446,145 @@ def main() -> int:
     exact_16bit = {dtype: int(np.count_nonzero(hist)) for dtype, hist in bit_histograms.items()}
     exact_32bit = len(float32_patterns) if float32_patterns_exact and float32_patterns is not None else None
 
+    # Split each tensor's sample independently. This avoids train/validation leakage and
+    # permits validation errors to be weighted by the actual parameter count of each tensor.
+    rng_split = np.random.default_rng(args.seed + 1)
+    train_samples: dict[tuple[str, str], np.ndarray] = {}
+    val_samples: dict[tuple[str, str], np.ndarray] = {}
+    tensor_by_key = {(t["file"], t["name"]): t for t in tensors}
+    for key, values in tensor_samples.items():
+        values = np.asarray(values, dtype=np.float32)
+        values = values[np.isfinite(values)]
+        if values.size <= 1:
+            train_samples[key] = values
+            val_samples[key] = np.empty(0, dtype=np.float32)
+            continue
+        perm = rng_split.permutation(values.size)
+        n_val = max(1, min(values.size - 1, int(round(values.size * args.validation_fraction))))
+        val_samples[key] = values[perm[:n_val]]
+        train_samples[key] = values[perm[n_val:]]
+
+    # Population-weighted standard deviation from the streamed full-tensor statistics.
+    stat_weight = sum(s["numel"] for s in tensor_stats)
+    model_mean = sum(s["numel"] * s["mean"] for s in tensor_stats) / max(1, stat_weight)
+    model_second = sum(
+        s["numel"] * (s["std"] * s["std"] + s["mean"] * s["mean"]) for s in tensor_stats
+    ) / max(1, stat_weight)
+    model_weight_std = math.sqrt(max(0.0, model_second - model_mean * model_mean))
+
+    # Weight each sampled value by tensor_population / tensor_sample_count so that
+    # forced coverage of small tensors does not distort the learned global distribution.
     groups_rows: list[dict[str, Any]] = []
-    for requested_k in args.groups:
-        centers, mse, mae, rmse = weighted_1d_kmeans(sample, requested_k)
-        actual_k = int(centers.size)
-        bits_per_index = int(math.ceil(math.log2(actual_k))) if actual_k > 1 else 0
-        packed_index_bytes = (total_params * bits_per_index + 7) // 8
-        codebook_bytes = actual_k * 4  # float32 representatives, conservatively
-        estimated_bytes = packed_index_bytes + codebook_bytes
-        sample_std = float(np.std(sample, dtype=np.float64))
-        rel_rmse = rmse / sample_std if sample_std > 0 else 0.0
-        groups_rows.append({
-            "requested_groups": requested_k, "actual_groups": actual_k,
-            "index_bits_per_weight": bits_per_index,
-            "sample_rmse": rmse, "sample_mae": mae, "sample_mse": mse,
-            "relative_rmse_vs_sample_std": rel_rmse,
-            "estimated_index_MB_ideal_packed": packed_index_bytes / 1_000_000,
-            "estimated_codebook_MB_fp32": codebook_bytes / 1_000_000,
-            "estimated_total_MB_ideal_packed": estimated_bytes / 1_000_000,
-            "estimated_size_ratio_vs_source": estimated_bytes / total_bytes if total_bytes else 0.0,
-            "estimated_savings_pct_vs_source": (1 - estimated_bytes / total_bytes) * 100 if total_bytes else 0.0,
-            "note": "Estimativa ideal por amostra; não inclui metadados/overhead e não é um checkpoint codificado",
-        })
+    for scope in args.scopes:
+        group_train_values: dict[str, list[np.ndarray]] = defaultdict(list)
+        group_train_weights: dict[str, list[np.ndarray]] = defaultdict(list)
+        tensor_group: dict[tuple[str, str], str] = {}
+        for t in tensors:
+            key = (t["file"], t["name"])
+            gkey = group_key_for_tensor(t["name"], scope)
+            tensor_group[key] = gkey
+            values = train_samples.get(key, np.empty(0, dtype=np.float32))
+            if values.size == 0:
+                continue
+            per_value_weight = float(t["numel"]) / float(values.size)
+            group_train_values[gkey].append(values)
+            group_train_weights[gkey].append(np.full(values.size, per_value_weight, dtype=np.float64))
+
+        for requested_k in args.groups:
+            centers_by_group: dict[str, np.ndarray] = {}
+            requested_capped_groups = 0
+            for gkey, parts in group_train_values.items():
+                x = np.concatenate(parts).astype(np.float32, copy=False)
+                weights = np.concatenate(group_train_weights[gkey]).astype(np.float64, copy=False)
+                unique_count = int(np.unique(x).size)
+                if unique_count < requested_k:
+                    requested_capped_groups += 1
+                centers, _, _, _ = weighted_1d_kmeans(x, requested_k, weights)
+                centers_by_group[gkey] = cast_codebook(centers, args.codebook_dtype)
+
+            squared_error_weighted = 0.0
+            absolute_error_weighted = 0.0
+            max_absolute_error = 0.0
+            val_sample_count = 0
+            val_parameter_coverage = 0
+            train_squared_error_weighted = 0.0
+            train_parameter_coverage = 0
+
+            for t in tensors:
+                key = (t["file"], t["name"])
+                gkey = tensor_group[key]
+                centers = centers_by_group.get(gkey)
+                if centers is None:
+                    continue
+                numel = int(t["numel"])
+                v = val_samples.get(key, np.empty(0, dtype=np.float32))
+                vmse, vmae, vmax, vn = evaluate_codebook(centers, v)
+                if vn:
+                    squared_error_weighted += vmse * numel
+                    absolute_error_weighted += vmae * numel
+                    max_absolute_error = max(max_absolute_error, vmax)
+                    val_sample_count += vn
+                    val_parameter_coverage += numel
+                tr = train_samples.get(key, np.empty(0, dtype=np.float32))
+                tmse, _, _, tn = evaluate_codebook(centers, tr)
+                if tn:
+                    train_squared_error_weighted += tmse * numel
+                    train_parameter_coverage += numel
+
+            val_rmse = math.sqrt(squared_error_weighted / val_parameter_coverage) if val_parameter_coverage else 0.0
+            val_mae = absolute_error_weighted / val_parameter_coverage if val_parameter_coverage else 0.0
+            train_rmse = math.sqrt(train_squared_error_weighted / train_parameter_coverage) if train_parameter_coverage else 0.0
+            rel_rmse = val_rmse / model_weight_std if model_weight_std > 0 else 0.0
+
+            codebook_bytes_per_value = {"fp32": 4, "fp16": 2, "bf16": 2}[args.codebook_dtype]
+            index_bytes = 0
+            weighted_index_bits = 0.0
+            min_index_bits = None
+            max_index_bits = 0
+            indexed_parameters = 0
+            for t in tensors:
+                key = (t["file"], t["name"])
+                centers = centers_by_group.get(tensor_group[key])
+                if centers is None:
+                    continue
+                n = int(t["numel"])
+                k_actual = int(centers.size)
+                bits = int(math.ceil(math.log2(k_actual))) if k_actual > 1 else 0
+                index_bytes += (n * bits + 7) // 8
+                weighted_index_bits += n * bits
+                indexed_parameters += n
+                min_index_bits = bits if min_index_bits is None else min(min_index_bits, bits)
+                max_index_bits = max(max_index_bits, bits)
+            codebook_values = sum(int(c.size) for c in centers_by_group.values())
+            codebook_bytes = codebook_values * codebook_bytes_per_value
+            estimated_bytes = index_bytes + codebook_bytes
+            estimated_ratio = estimated_bytes / total_bytes if total_bytes else 0.0
+            actual_groups_total = codebook_values
+            groups_rows.append({
+                "scope": scope,
+                "requested_groups_per_codebook": requested_k,
+                "codebook_count": len(centers_by_group),
+                "actual_groups_total_across_codebooks": actual_groups_total,
+                "groups_capped_by_sample_uniques": requested_capped_groups,
+                "codebook_dtype": args.codebook_dtype,
+                "index_bits_min": min_index_bits if min_index_bits is not None else 0,
+                "index_bits_max": max_index_bits,
+                "weighted_mean_index_bits_per_parameter": weighted_index_bits / indexed_parameters if indexed_parameters else 0.0,
+                "train_rmse_population_weighted": train_rmse,
+                "validation_rmse_population_weighted": val_rmse,
+                "validation_mae_population_weighted": val_mae,
+                "validation_rmse_over_full_model_weight_std": rel_rmse,
+                "validation_max_abs_error_sample": max_absolute_error,
+                "validation_sample_values": val_sample_count,
+                "validation_parameter_coverage": val_parameter_coverage,
+                "validation_parameter_coverage_pct": 100 * val_parameter_coverage / total_params if total_params else 0.0,
+                "estimated_index_MB_ideal_packed": index_bytes / 1_000_000,
+                "estimated_codebook_MB": codebook_bytes / 1_000_000,
+                "estimated_total_MB_ideal_packed": estimated_bytes / 1_000_000,
+                "estimated_size_ratio_vs_source": estimated_ratio,
+                "estimated_savings_pct_vs_source": (1 - estimated_ratio) * 100,
+                "note": "Estimativa ideal; codebooks compartilhados + mapa de índices. Não é ainda um checkpoint serializado.",
+            })
 
     tensor_stats.sort(key=lambda x: x["estimated_bytes"], reverse=True)
     write_csv(output_dir / "tensor_stats.csv", tensor_stats, [
@@ -375,8 +606,14 @@ def main() -> int:
         "sample_seed": args.seed,
         "sample_mean": float(np.mean(sample, dtype=np.float64)),
         "sample_std": float(np.std(sample, dtype=np.float64)),
+        "full_model_weighted_mean": model_mean,
+        "full_model_weighted_std": model_weight_std,
         "sample_min": float(np.min(sample)),
         "sample_max": float(np.max(sample)),
+        "analysis_scopes": args.scopes,
+        "codebook_dtype": args.codebook_dtype,
+        "validation_fraction": args.validation_fraction,
+        "min_samples_per_tensor": args.min_samples_per_tensor,
         "exact_unique_bit_patterns_16bit": exact_16bit,
         "exact_unique_float32_bit_patterns": exact_32bit,
         "float32_unique_count_is_exact": bool(float32_patterns_exact),
@@ -385,11 +622,15 @@ def main() -> int:
         "elapsed_seconds": round(time.time() - start_time, 2),
         "scan_seconds": round(time.time() - started_scan, 2),
         "caveats": [
-            "A quantidade de padrões exatos é separada por formato binário (BF16/F16/F32); formatos diferentes não compartilham a mesma contagem.",
-            "A análise de grupos aproximados usa amostra uniforme proporcional ao número de parâmetros, não todos os valores para calcular a distorção.",
-            "O codebook é global para todos os tensores; codebooks por tensor/camada podem reduzir o erro, mas adicionam metadados e custo de armazenamento.",
-            "O tamanho comprimido é uma estimativa ideal com índices bit-packed; nenhum peso quantizado/comprimido é escrito nesta primeira fase.",
-            "MSE/RMSE avaliam os valores dos pesos, não a qualidade linguística ou multimodal do modelo. É necessário validar as saídas antes de concluir que a compressão é útil.",
+            "A contagem de padrões binários é exata por formato (BF16/F16/F32), mas padrões de formatos distintos são contados separadamente.",
+            "Os codebooks são ajustados na amostra de treino e avaliados em uma amostra de validação separada por tensor.",
+            "O erro de validação é ponderado pelo número real de parâmetros de cada tensor; as amostras mínimas por tensor não dominam artificialmente a métrica.",
+            "Escopo global, por camada e por tensor têm custos diferentes: quanto mais codebooks, mais representantes/metadados são necessários.",
+            "O mapa de índices continua necessário para reconstruir qual representante corresponde a cada posição; estimativas assumem índices idealmente empacotados.",
+            "O tamanho estimado não inclui cabeçalhos, alinhamento, checksum, descritores e detalhes do formato final, e não é um checkpoint serializado.",
+            "Representantes podem ser FP32, FP16 ou BF16, independentemente do número de bits usados nos índices.",
+            "A RMSE dos pesos não demonstra preservação de qualidade linguística; será necessário reconstruir matrizes e avaliar logits/perplexidade/respostas.",
+            "Este programa ainda não grava checkpoint quantizado e não mede a sobrecarga de inferência de lookup/reconstrução.",
         ],
     }
     with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
@@ -404,15 +645,18 @@ def main() -> int:
         print(f"Padrões F32 distintos exatos    : {exact_32bit:,}")
     else:
         print("Padrões F32 distintos exatos    : limite atingido; veja o JSON")
-    print("\nGrupos | RMSE amostral | RMSE/desvio-padrão | Tamanho estimado | Economia estimada")
+    print("\nEscopo  | Grupos/codebook | Codebooks | RMSE validação | RMSE/desvio-padrão | Tamanho ideal | Economia")
     for row in groups_rows:
-        print(f"{row['actual_groups']:>6} | {row['sample_rmse']:.6g} | {row['relative_rmse_vs_sample_std']:.6g} | "
-              f"{row['estimated_total_MB_ideal_packed']:.2f} MB | {row['estimated_savings_pct_vs_source']:.2f}%")
+        print(f"{row['scope']:<7} | {row['requested_groups_per_codebook']:>14} | {row['codebook_count']:>9} | "
+              f"{row['validation_rmse_population_weighted']:.6g} | "
+              f"{row['validation_rmse_over_full_model_weight_std']:.6g} | "
+              f"{row['estimated_total_MB_ideal_packed']:.2f} MB | "
+              f"{row['estimated_savings_pct_vs_source']:.2f}%")
     print(f"\nArquivos gravados em: {output_dir.resolve()}")
     print("  - summary.json      (resumo completo e ressalvas)")
     print("  - group_analysis.csv (trade-off entre grupos, erro e tamanho estimado)")
     print("  - tensor_stats.csv   (estatísticas por tensor/camada)")
-    print("\nNota: esta fase mede potencial. Ainda não produz um modelo comprimido funcional.")
+    print("\nNota: esta fase mede o potencial de representantes compartilhados. Ainda não produz um checkpoint reconstruído.")
     return 0
 
 
