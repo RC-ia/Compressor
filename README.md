@@ -1,18 +1,28 @@
-# Compressor — análise matemática bruta de pesos
+# Compressor — reconstrução aproximada por representantes compartilhados
 
-Primeira fase do experimento: examinar diretamente os pesos Safetensors e medir se um conjunto de valores compartilhados consegue representar os parâmetros com menos armazenamento.
+Experimento de pesquisa para testar se milhares ou milhões de pesos podem ser substituídos por um conjunto menor de valores representativos. Os pesos originais individuais deixam de ser armazenados: a reconstrução usa um **codebook de representantes** e um **índice por posição**.
 
-O projeto começa com `Qwen/Qwen3.5-4B`, mas também aceita qualquer diretório local que contenha arquivos `.safetensors`.
+O alvo inicial é `Qwen/Qwen3.5-4B` em Safetensors. O código não converte para GGUF e não instancia o modelo Transformers completo para fazer a análise.
 
-## O que o script mede
+## Ideia
 
-- Quantidade de parâmetros flutuantes e tamanho bruto estimado dos tensores.
-- Contagem **exata** de padrões binários distintos em pesos BF16 e FP16, separadamente por formato.
-- Estatísticas por tensor/camada: forma, mínimo, máximo, média, desvio-padrão, zeros e amostra de valores distintos.
-- Codebooks globais com 2, 4, 8, 16, 32, ... grupos, comparando RMSE/MAE na amostra.
-- Estimativa ideal de armazenamento usando índices compactados em bits e uma tabela de representantes FP32.
+Para cada peso original (w_i), o agrupamento seleciona um representante (c_j). A reconstrução aproxima o peso usando (hat w_i=c_j). Com (K) representantes, um índice precisa identificar qual dos (K) valores pertence a cada posição. Em princípio são necessários (lceillog_2 Kceil) bits por índice, além do próprio codebook e dos metadados.
 
-Os tensores são lidos em blocos pela API Safetensors; o modelo não é instanciado em Transformers e nenhuma GPU é necessária. O download inicial do modelo pode, contudo, exigir vários GB de espaço e internet.
+Isso não é uma compressão sem custo de informação: o mapa de associações é essencial para saber onde cada representante deve ser usado. A hipótese a testar é que esse mapa seja muito menor que armazenar cada peso em 16 bits, com uma perda aceitável.
+
+## O que o analisador faz
+
+- Lê arquivos Safetensors em blocos, sem carregar o modelo inteiro na RAM.
+- Conta padrões binários distintos em BF16/FP16 e, quando possível, F32.
+- Faz amostragem estratificada por tensor: mantém cobertura de tensores pequenos e distribui o restante da amostra por tamanho.
+- Divide a amostra de cada tensor em conjuntos separados de treino e validação.
+- Testa três estratégias de codebook:
+  - **global**: um codebook para todos os tensores;
+  - **layer**: codebook compartilhado por camada do backbone; embeddings, normas finais e tensores sem índice de camada ficam isolados;
+  - **tensor**: codebook independente por tensor.
+- Ajusta representantes com k-means escalar ponderado. Os pesos da amostra compensam a cobertura mínima por tensor, para que tensores pequenos não dominem artificialmente o ajuste.
+- Avalia o erro em dados mantidos fora do ajuste, ponderado pelo número real de parâmetros de cada tensor.
+- Estima armazenamento com índices empacotados e codebooks FP32, FP16 ou BF16.
 
 ## Instalação
 
@@ -22,48 +32,75 @@ Python 3.10+ recomendado.
 pip install -r requirements.txt
 ```
 
-## Execução completa no modelo do Hugging Face
+## Execução no Qwen
 
 ```bash
-python analyze_weights.py --model Qwen/Qwen3.5-4B
+python analyze_weights.py --model Qwen/Qwen3.5-4B --sample-size 500000
 ```
 
-O script baixa os arquivos `.safetensors` e JSON necessários para o cache do Hugging Face, analisa os tensores e cria `compressor_results/` com:
+O primeiro uso baixa do Hugging Face os arquivos `.safetensors` e metadados necessários, consumindo vários GB de espaço. A análise é executada na CPU e pode levar um tempo considerável para testar todos os grupos.
 
-- `summary.json`
-- `group_analysis.csv`
-- `tensor_stats.csv`
-
-## Opções úteis
+## Opções
 
 ```bash
-# Avaliar mais pesos na amostra
-python analyze_weights.py --model Qwen/Qwen3.5-4B --sample-size 500000
+# Aumentar amostra e cobertura mínima por tensor
+python analyze_weights.py --model Qwen/Qwen3.5-4B \
+  --sample-size 1000000 --min-samples-per-tensor 256
 
-# Testar grupos específicos
-python analyze_weights.py --model Qwen/Qwen3.5-4B --groups 16,32,64,128,256,512,1024,2048,4096
+# Comparar somente codebook global e por camada (execução mais curta)
+python analyze_weights.py --model Qwen/Qwen3.5-4B \
+  --scopes global,layer --groups 4,8,16,32,64,128,256,512,1024
 
-# Reutilizar arquivos que já estão baixados
+# Testar codebooks BF16 para reduzir o custo de armazenamento dos representantes
+python analyze_weights.py --model Qwen/Qwen3.5-4B \
+  --codebook-dtype bf16 --groups 4,16,64,256,1024
+
+# Usar arquivos de checkpoint já baixados
 python analyze_weights.py --model ./Qwen3.5-4B --output-dir resultados
 
-# Ajustar a RAM usada por bloco
+# Controlar a quantidade aproximada de elementos lidos por bloco
 python analyze_weights.py --model Qwen/Qwen3.5-4B --chunk-elements 250000
 ```
 
-## Como interpretar
+Argumentos principais:
 
-- **Padrões exatos distintos**: número de codificações de pesos que realmente aparecem no formato, não o número de grupos aproximados necessário para manter a qualidade.
-- **Grupos**: quantidade de representantes numéricos compartilhados em um codebook escalar global.
-- **RMSE relativo**: RMSE de reconstrução da amostra dividido pelo desvio-padrão dessa amostra. Menor significa menor erro numérico médio, não necessariamente menor perda de qualidade do modelo.
-- **Economia estimada**: cenário ideal com índices empacotados usando `ceil(log2(K))` bits por peso, mais representantes FP32. Não inclui metadados, alinhamento, acesso aleatório nem implementação de kernels. Não é a taxa de compressão medida de um arquivo final.
+| Argumento | Padrão | Significado |
+|---|---|---|
+| `--sample-size` | 150000 | Número de pesos amostrados para análise |
+| `--min-samples-per-tensor` | 128 | Cobertura mínima de cada tensor, sujeita ao orçamento total |
+| `--validation-fraction` | 0.2 | Fração da amostra separada para validação |
+| `--groups` | 2 a 4096 | Número máximo de representantes por codebook |
+| `--scopes` | `global,layer,tensor` | Estratégias de compartilhamento a comparar |
+| `--codebook-dtype` | `fp32` | Precisão usada para armazenar os representantes |
 
-## Limitações desta primeira fase
+## Resultados
 
-1. O codebook global junta tensores com escalas e funções diferentes. Codebooks separados por tensor, camada ou tipo de parâmetro podem melhorar a reconstrução, com custo adicional.
-2. A contagem BF16/FP16 é exata no nível dos bits; a qualidade dos grupos é estimada a partir de uma amostra uniforme proporcional ao tamanho dos tensores.
-3. O erro dos pesos não é suficiente para validar um modelo de linguagem ou visão-linguagem. A próxima fase precisa codificar e reconstruir os pesos e comparar saídas/perplexidade com um conjunto de avaliação.
-4. Esta ferramenta não altera o checkpoint original e ainda não salva um modelo comprimido.
+O diretório `compressor_results/` conterá:
 
-## Próxima etapa sugerida
+- `summary.json`: metadados, estatísticas globais, contagem de padrões exatos e resultados agregados.
+- `group_analysis.csv`: uma linha por estratégia e quantidade de grupos, com RMSE/MAE de validação, bits por índice e custo estimado.
+- `tensor_stats.csv`: estatísticas de valores por tensor/camada.
 
-Usar os CSVs para selecionar alguns valores de `K`; implementar encoder/decoder de codebook e comparar (a) codebook único global, (b) codebook por camada/tensor e (c) resíduos para os pesos que mais afetam a saída. Só então comparar tamanho real, velocidade e qualidade do modelo reconstruído.
+Campos que merecem atenção em `group_analysis.csv`:
+
+- **`scope`**: estratégia global, por camada ou por tensor.
+- **`requested_groups_per_codebook`**: máximo solicitado para cada tabela de representantes.
+- **`actual_groups_total_across_codebooks`**: soma dos representantes efetivamente utilizados em todas as tabelas.
+- **`validation_rmse_population_weighted`**: erro quadrático médio na validação, ponderado pelo número de parâmetros do tensor.
+- **`validation_rmse_over_full_model_weight_std`**: RMSE de validação dividido pelo desvio-padrão dos pesos do modelo completo.
+- **`weighted_mean_index_bits_per_parameter`**: custo médio estimado dos índices.
+- **`estimated_total_MB_ideal_packed`**: índices mais codebooks, em um empacotamento ideal, antes de cabeçalhos e outros metadados.
+- **`groups_capped_by_sample_uniques`**: codebooks que não puderam chegar ao número solicitado porque a amostra de treino daquele grupo tinha menos valores distintos.
+
+## Como interpretar sem tirar conclusões precipitadas
+
+1. Pouco erro numérico nos pesos não garante a mesma perplexidade, logits ou qualidade de resposta.
+2. O codebook global tende a ser mais barato, mas pode misturar distribuições muito diferentes. Codebooks locais podem diminuir o erro, ao custo de tabelas extras.
+3. O codebook por tensor pode ficar limitado pela quantidade de amostras disponíveis de tensores pequenos. Se muitos codebooks forem limitados, aumente `--sample-size` e `--min-samples-per-tensor`.
+4. As taxas de armazenamento são estimativas, não tamanho medido de um arquivo final. Incluem índices idealmente empacotados por tensor e representantes no dtype escolhido, mas não cabeçalhos, alinhamento, descritores nem overhead de carregamento.
+5. A reconstrução envolve lookup de representantes. O custo durante inferência e a compatibilidade com kernels de GPU/CPU precisam ser medidos separadamente; não está garantido que a execução fique mais rápida.
+6. O analisador não modifica nem regrava o checkpoint original.
+
+## Próxima etapa experimental
+
+Escolher uma ou duas configurações com boa relação erro/tamanho, implementar encoder e decoder de verdade, reconstruir uma ou duas matrizes, verificar o erro diretamente em todos os seus pesos e comparar as saídas de camadas. Só depois avaliar o modelo completo com perplexidade/logits e inferência real.
