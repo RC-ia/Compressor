@@ -391,16 +391,16 @@ Embora as camadas posteriores não sejam executadas, `from_pretrained` ainda ini
 
 ## Mapa esparso de correções individuais para Q4_0
 
-O script `q4_correction_map.py` compara cada peso de origem com a reconstrução Q4_0 e gera mapas esparsos independentes para os limites absolutos `1.0`, `0.8`, `0.6`, `0.5`, `0.4`, `0.3`, `0.2` e `0.1`. Para cada peso acima do limite, armazena apenas o índice global delta-coded e o resíduo FP16 (`original - Q4`). A correção aplicada é `Q4 + resíduo`; o script mede também o erro restante causado pelo armazenamento do resíduo em FP16.
+O script `q4_correction_map.py` compara cada peso de origem com a reconstrução Q4_0 e gera mapas esparsos independentes para os limites absolutos `1.0`, `0.8`, `0.6`, `0.5`, `0.4`, `0.3`, `0.2`, `0.1`, `0.08`, `0.05`, `0.03` e `0.01`. Para cada peso acima do limite, armazena apenas o índice global delta-coded e o resíduo FP16 (`original - Q4`). A correção aplicada é `Q4 + resíduo`; o script mede também o erro restante causado pelo armazenamento do resíduo em FP16.
 
 ```powershell
 .\.venv-smoke\Scripts\python.exe q4_correction_map.py `
   --model ".\Qwen3.5-4B" `
-  --thresholds 1.0,0.8,0.6,0.5,0.4,0.3,0.2,0.1 `
+  --thresholds 1.0,0.8,0.6,0.5,0.4,0.3,0.2,0.1,0.08,0.05,0.03,0.01 `
   --output-dir q4_correction_map_results
 ```
 
-Para cada limite, cria `correction_map_gt_*.bin`; `report.json` informa número de correções, blocos/tensores atingidos, tamanho real do mapa e erro máximo após aplicar o resíduo FP16. `tensor_manifest.json` mapeia os índices globais para tensores e offsets, inclusive os que foram excluídos da simulação. Os bytes do mapa são medidos no arquivo real e não incluem o modelo Q4 base nem o manifesto.
+Para cada limite, cria `correction_map_gt_*.bin`; `report.json` informa número de correções, blocos/tensores atingidos, tamanho real do mapa, maior erro entre os pesos corrigidos, erro máximo global após aplicar o mapa, RMSE global e contagem de pesos que ainda ultrapassam o limite. `tensor_manifest.json` mapeia os índices globais para tensores e offsets, inclusive os que foram excluídos da simulação. Os bytes do mapa são medidos no arquivo real e não incluem o modelo Q4 base nem o manifesto.
 
 **Interpretação:** este é um teste de tamanho e erro numérico com Q4_0 simulado diretamente a partir do checkpoint, não uma quantização do checkpoint para um arquivo GGUF nem um teste de perplexidade/qualidade de geração. Um resíduo FP16 é uma correção aproximada, e os mapas são dados experimentais; ainda não há um carregador de inferência que aplique esses mapas a um modelo Q4 externo.
 
