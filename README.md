@@ -523,6 +523,23 @@ Saídas:
 
 O mapa auxiliar é apenas exportado: ele **não modifica o checkpoint nem é aplicado automaticamente pelo Transformers**. A aplicação durante a inferência ainda exige um módulo que interprete o manifesto, decodifique as entradas e some a contribuição dos resíduos nas camadas correspondentes.
 
+### Exportar mapas maiores em vários limiares
+
+Para produzir mapas separados para cada limiar de 0,009 até 0,001 **em uma única leitura/desquantização do checkpoint**, use `--correction-thresholds`:
+
+```powershell
+.\.venv-smoke\Scripts\python.exe compare_bnb_weights.py `
+  --source-model ".\Qwen3.5-4B" `
+  --quantized-model "techwithsergiu/Qwen3.5-text-4B-bnb-4bit" `
+  --device cuda `
+  --correction-thresholds 0.009,0.008,0.007,0.006,0.005,0.004,0.003,0.002,0.001 `
+  --output-dir bnb_weight_validation
+```
+
+A opção ativa automaticamente a exportação e cria nove pares de arquivos, por exemplo `correction_map_gt_0p009.bin` com `correction_map_gt_0p009_manifest.json`, até `correction_map_gt_0p001.bin` e seu manifesto. O limiar é aplicado ao erro absoluto `abs(BF16_original - NF4_desquantizado)`; cada entrada salva o resíduo assinado em FP16 e o índice do peso. O mapa de limiar menor inclui mais pesos e não substitui nem altera os mapas dos outros limiares.
+
+**Atenção ao espaço em disco:** perto de 0,001 uma parcela grande dos pesos pode ultrapassar o limiar. Como cada limiar gera um arquivo próprio, o conjunto pode ocupar vários GB e a geração pode levar tempo. O exportador codifica os índices em blocos NumPy para evitar uma chamada Python de escrita por peso. Verifique o espaço livre antes de executar. Se quiser gerar somente um mapa grande, use `--export-corrections --correction-threshold 0.001`; nesse modo o nome do manifesto continua sendo `correction_map_manifest.json`.
+
 **Importante:** o script usa a desquantização do bitsandbytes sobre os dados realmente armazenados; não quantiza de novo os pesos de origem. Ele mede diferenças numéricas dos pesos, não perplexidade nem qualidade de geração. Se a desquantização NF4 falhar no backend CUDA instalado, o script interrompe com o nome do tensor em vez de substituir silenciosamente o resultado por uma simulação.
 
 
