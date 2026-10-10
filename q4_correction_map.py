@@ -110,10 +110,18 @@ def main() -> int:
             tensor_offset = global_offset
             global_offset += numel
 
-            if not shape or numel % BLOCK or (len(shape) > 1 and shape[-1] % BLOCK):
+            eligible = bool(shape) and numel % BLOCK == 0 and not (len(shape) > 1 and shape[-1] % BLOCK)
+            tensor_manifest.append({
+                "tensor_id": tensor_id, "tensor": name, "shape": list(shape),
+                "num_weights": numel, "global_offset": tensor_offset,
+                "source_dtype": "recorded_during_scan",
+                "q4_0_eligible": eligible,
+            })
+            if not eligible:
                 skipped.append({
                     "tensor_id": tensor_id, "tensor": name, "shape": list(shape),
                     "num_weights": numel,
+                    "global_offset": tensor_offset,
                     "reason": "cannot align Q4_0 blocks of 32 within tensor rows",
                 })
                 continue
@@ -186,11 +194,7 @@ def main() -> int:
 
             if carry.size:
                 raise RuntimeError(f"{name}: leftover {carry.size} values not aligned to Q4_0 block")
-            tensor_manifest.append({
-                "tensor_id": tensor_id, "tensor": name, "shape": list(shape),
-                "num_weights": numel, "global_offset": tensor_offset,
-                "source_dtype": source_dtype if numel else "unknown",
-            })
+            tensor_manifest[-1]["source_dtype"] = source_dtype if numel else "unknown"
             for t in thresholds:
                 if tensor_counts[t]:
                     stats[t]["blocks_affected"] += len(tensor_blocks[t])
