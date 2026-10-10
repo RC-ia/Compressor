@@ -121,6 +121,10 @@ def main() -> int:
     )
     parser.add_argument("--top-k", type=int, default=1000,
                         help="How many worst individual weights and blocks to save")
+    parser.add_argument(
+        "--error-threshold", type=float, default=1.0,
+        help="Also export every weight with absolute BF16/source-to-Q4 error strictly greater than this value (default: 1.0)",
+    )
     parser.add_argument("--chunk-elements", type=int, default=1_048_576,
                         help="Approximate number of source values loaded per chunk")
     parser.add_argument("--output-dir", default="q4_weight_deviation_results")
@@ -132,6 +136,8 @@ def main() -> int:
 
     if args.top_k <= 0:
         parser.error("--top-k must be positive")
+    if not math.isfinite(args.error_threshold) or args.error_threshold < 0:
+        parser.error("--error-threshold must be a finite, non-negative number")
     if args.chunk_elements < BLOCK:
         parser.error("--chunk-elements must be at least 32")
     if args.dump_all_weights and not args.tensor_name:
@@ -154,7 +160,31 @@ def main() -> int:
     skipped: list[dict[str, Any]] = []
     total_quantized_weights = 0
     total_nonzero_errors = 0
+    total_threshold_weights = 0
+    total_threshold_blocks = 0
+    tensors_with_threshold_weights = 0
     sequence = 0
+    threshold_tensor_rows: list[dict[str, Any]] = []
+    threshold_weight_path = output_dir / "weights_above_threshold.csv"
+    threshold_block_path = output_dir / "blocks_above_threshold.csv"
+    threshold_weights_stream = threshold_weight_path.open("w", newline="", encoding="utf-8-sig")
+    threshold_weights_writer = csv.writer(threshold_weights_stream)
+    threshold_weights_writer.writerow([
+        "tensor", "shape", "source_dtype", "flat_index", "coordinates",
+        "block_index", "position_in_block", "bf16_original", "q4_reconstructed",
+        "delta_q4_minus_bf16", "absolute_error", "relative_error_percent",
+        "q4_scale_step", "error_in_q4_steps", "block_start_flat_index",
+        "block_start_coordinates",
+    ])
+    threshold_blocks_stream = threshold_block_path.open("w", newline="", encoding="utf-8-sig")
+    threshold_blocks_writer = csv.writer(threshold_blocks_stream)
+    threshold_blocks_writer.writerow([
+        "tensor", "shape", "source_dtype", "block_index", "block_start_flat_index",
+        "block_start_coordinates", "weights_above_threshold", "positions_above_threshold",
+        "max_absolute_error", "worst_position_in_block", "worst_weight_flat_index",
+        "worst_weight_coordinates", "bf16_original", "q4_reconstructed",
+        "delta_q4_minus_bf16", "q4_scale_step",
+    ])
     dump_stream = None
     dump_writer = None
     dump_path = output_dir / "all_weight_errors.csv"
@@ -197,6 +227,8 @@ def main() -> int:
             tensor_worst: dict[str, Any] | None = None
             tensor_max_error = -1.0
             tensor_nonzero = 0
+            tensor_threshold_count = 0
+            tensor_threshold_block_count = 0
             seen = 0
             carry = np.empty(0, dtype=np.float32)
             source_dtype = "unknown"
@@ -234,6 +266,55 @@ def main() -> int:
                     total_quantized_weights += int(source.size)
                     tensor_nonzero += int(np.count_nonzero(abs_errors))
                     total_nonzero_errors += int(np.count_nonzero(abs_errors))
+
+                    # Export every individual weight whose absolute deviation exceeds the threshold.
+                    above = np.flatnonzero(abs_errors > args.error_threshold)
+                    tensor_threshold_count += int(above.size)
+                    total_threshold_weights += int(above.size)
+                    for local in above:
+                        local_i = int(local)
+                        flat_index = combined_start + local_i
+                        block_start = (flat_index // BLOCK) * BLOCK
+                        rec = weight_record(
+                            name, shape, source_dtype, flat_index,
+                            float(source[local_i]), float(reconstructed[local_i]),
+                            float(errors[local_i]), float(scales[local_i // BLOCK]),
+                        )
+                        rec["block_start_flat_index"] = block_start
+                        rec["block_start_coordinates"] = coordinate(block_start, shape)
+                        threshold_weights_writer.writerow([
+                            rec["tensor"], json.dumps(rec["shape"], separators=(",", ":")),
+                            rec["source_dtype"], rec["flat_index"], rec["coordinates"],
+                            rec["block_index"], rec["position_in_block"], rec["bf16_original"],
+                            rec["q4_reconstructed"], rec["delta_q4_minus_bf16"],
+                            rec["absolute_error"],
+                            rec["relative_error_percent"] if rec["relative_error_percent"] is not None else "",
+                            rec["q4_scale_step"], rec["error_in_q4_steps"],
+                            rec["block_start_flat_index"], rec["block_start_coordinates"],
+                        ])
+
+                    # Export affected blocks and the exact positions exceeding the threshold.
+                    block_above_positions = block_abs_errors > args.error_threshold
+                    block_above_counts = np.count_nonzero(block_above_positions, axis=1)
+                    affected_block_indices = np.flatnonzero(block_above_counts > 0)
+                    tensor_threshold_block_count += int(affected_block_indices.size)
+                    total_threshold_blocks += int(affected_block_indices.size)
+                    for b_i_raw in affected_block_indices:
+                        b_i = int(b_i_raw)
+                        positions = np.flatnonzero(block_above_positions[b_i]).astype(int).tolist()
+                        worst_pos = int(np.argmax(block_abs_errors[b_i]))
+                        block_start = combined_start + b_i * BLOCK
+                        worst_flat = block_start + worst_pos
+                        threshold_blocks_writer.writerow([
+                            name, json.dumps(list(shape), separators=(",", ":")),
+                            source_dtype, worst_flat // BLOCK, block_start,
+                            coordinate(block_start, shape), int(block_above_counts[b_i]),
+                            json.dumps(positions, separators=(",", ":")),
+                            float(block_abs_errors[b_i, worst_pos]), worst_pos, worst_flat,
+                            coordinate(worst_flat, shape), float(block_source[b_i, worst_pos]),
+                            float(block_recon[b_i, worst_pos]), float(block_errors[b_i, worst_pos]),
+                            float(block_scales[b_i]),
+                        ])
 
                     # Optional exact per-weight file for one selected tensor.
                     if dump_writer is not None and name == args.tensor_name:
@@ -322,6 +403,18 @@ def main() -> int:
                     f"Tensor {name} terminou com {carry.size} valores fora de um bloco Q4_0; "
                     "a contagem deveria ser múltipla de 32."
                 )
+            if tensor_threshold_count > 0:
+                tensors_with_threshold_weights += 1
+            threshold_tensor_rows.append({
+                "tensor": name,
+                "shape": list(shape),
+                "source_dtype": source_dtype,
+                "num_weights": numel,
+                "weights_above_threshold": tensor_threshold_count,
+                "blocks_with_weights_above_threshold": tensor_threshold_block_count,
+                "max_absolute_error": tensor_max_error if tensor_max_error >= 0 else None,
+                "error_threshold": args.error_threshold,
+            })
             if tensor_worst is not None:
                 tensor_maxima.append({
                     "tensor": name,
@@ -342,6 +435,27 @@ def main() -> int:
     finally:
         if dump_stream is not None:
             dump_stream.close()
+        threshold_weights_stream.close()
+        threshold_blocks_stream.close()
+
+    with (output_dir / "tensor_threshold_counts.csv").open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as stream:
+        fields = [
+            "tensor", "shape", "source_dtype", "num_weights",
+            "weights_above_threshold", "blocks_with_weights_above_threshold",
+            "max_absolute_error", "error_threshold",
+        ]
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for row in sorted(
+            threshold_tensor_rows,
+            key=lambda r: (r["weights_above_threshold"], r["max_absolute_error"] or 0),
+            reverse=True,
+        ):
+            clean = dict(row)
+            clean["shape"] = json.dumps(clean["shape"], separators=(",", ":"))
+            writer.writerow(clean)
 
     top_weights = [item[2] for item in sorted(worst_weights, key=lambda x: x[0], reverse=True)]
     top_blocks = [item[2] for item in sorted(worst_blocks, key=lambda x: x[0], reverse=True)]
@@ -372,6 +486,10 @@ def main() -> int:
             "No mean error, RMSE, standard deviation, cosine similarity, or average is used to rank the losses."
         ],
         "top_k": int(args.top_k),
+        "absolute_error_threshold_strictly_greater_than": float(args.error_threshold),
+        "weights_with_absolute_error_above_threshold": total_threshold_weights,
+        "blocks_containing_weights_above_threshold": total_threshold_blocks,
+        "tensors_containing_weights_above_threshold": tensors_with_threshold_weights,
         "quantized_tensor_count": len(tensor_maxima),
         "skipped_tensor_count": len(skipped),
         "quantized_weight_count": total_quantized_weights,
@@ -380,11 +498,17 @@ def main() -> int:
             "top_weight_deviations.csv": "Worst individual weights across the analyzed model/tensor, ranked by absolute BF16-to-Q4 difference.",
             "top_block_deviations.csv": "Worst 32-weight Q4_0 blocks, ranked by the largest single weight error in each block.",
             "worst_weight_per_tensor.csv": "The single most changed weight in every analyzed tensor.",
+            "weights_above_threshold.csv": "Every individual weight with absolute source-to-Q4 error strictly greater than --error-threshold.",
+            "blocks_above_threshold.csv": "Every Q4_0 block with at least one weight over threshold, including exact positions and worst weight in the block.",
+            "tensor_threshold_counts.csv": "Per-tensor counts of weights and blocks containing errors above threshold, including tensors with zero hits.",
             "skipped_tensors.json": "Tensors that cannot be aligned to Q4_0 blocks of 32 without crossing row boundaries.",
             "all_weight_errors.csv": "Present only with --dump-all-weights and --tensor-name; exact per-weight detail for that selected tensor."
         },
         "skipped_tensors": skipped,
         "all_weight_errors_csv": str(dump_path) if args.dump_all_weights else None,
+        "threshold_weight_csv": str(threshold_weight_path),
+        "threshold_block_csv": str(threshold_block_path),
+        "threshold_tensor_counts_csv": str(output_dir / "tensor_threshold_counts.csv"),
     }
     (output_dir / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -397,10 +521,21 @@ def main() -> int:
     print(f"Tensores quantizados: {len(tensor_maxima)}")
     print(f"Pesos analisados: {total_quantized_weights:,}")
     print(f"Pesos com diferença numérica: {total_nonzero_errors:,}")
+    print(
+        f"Pesos com erro absoluto > {args.error_threshold:g}: "
+        f"{total_threshold_weights:,}"
+    )
+    print(
+        f"Blocos com pelo menos um peso acima do limite: {total_threshold_blocks:,} "
+        f"| tensores atingidos: {tensors_with_threshold_weights:,}"
+    )
     print(f"Tensores não alinhados ao Q4_0: {len(skipped)}")
     print(f"Top pesos: {output_dir / 'top_weight_deviations.csv'}")
     print(f"Top blocos: {output_dir / 'top_block_deviations.csv'}")
     print(f"Pior peso por tensor: {output_dir / 'worst_weight_per_tensor.csv'}")
+    print(f"Pesos acima do limite: {threshold_weight_path}")
+    print(f"Blocos acima do limite: {threshold_block_path}")
+    print(f"Contagens por tensor: {output_dir / 'tensor_threshold_counts.csv'}")
     print(f"Relatório: {output_dir / 'report.json'}")
     if args.dump_all_weights:
         print(f"Todos os pesos do tensor escolhido: {dump_path}")
