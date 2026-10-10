@@ -409,6 +409,10 @@ def main() -> int:
         help="Limite de RAM reservado ao modelo de referência; o excedente será enviado para disco (padrão: 4GiB)."
     )
     parser.add_argument(
+        "--reference-gpu-memory", default=None,
+        help="Limite de VRAM para a referência BF16/FP16, por exemplo 3GiB. Use dtype FP16 em GPUs sem suporte a BF16."
+    )
+    parser.add_argument(
         "--reference-offload-folder", default=None,
         help="Pasta para pesos temporários do modelo BF16 enviados ao disco. Padrão: <pasta do relatório>/bf16_offload."
     )
@@ -587,16 +591,26 @@ def main() -> int:
             else output_parent / "bf16_offload"
         )
         offload_folder.mkdir(parents=True, exist_ok=True)
+        reference_max_memory: dict[Any, str] = {
+            "cpu": args.reference_max_cpu_memory,
+        }
+        if args.reference_gpu_memory:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "--reference-gpu-memory foi informado, mas CUDA não está disponível."
+                )
+            reference_max_memory[0] = args.reference_gpu_memory
         print(
             f"Carregando referência {args.reference_model} com dtype={args.reference_dtype}; "
-            f"limite de RAM={args.reference_max_cpu_memory}. "
-            "Atenção: camadas excedentes serão temporariamente armazenadas em disco.",
+            f"limite de RAM={args.reference_max_cpu_memory}; "
+            f"limite de VRAM={args.reference_gpu_memory or 'não definido'}. "
+            "Pesos que não couberem serão temporariamente armazenados em disco.",
             flush=True,
         )
         reference_model = AutoModelForCausalLM.from_pretrained(
             args.reference_model,
             device_map="auto",
-            max_memory={"cpu": args.reference_max_cpu_memory},
+            max_memory=reference_max_memory,
             offload_folder=str(offload_folder),
             offload_state_dict=True,
             dtype=reference_dtype_map[args.reference_dtype],
