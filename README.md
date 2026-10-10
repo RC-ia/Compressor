@@ -389,28 +389,29 @@ O arquivo `neuron_activation_report.json` registra quantos pares têm correlaç�
 
 Embora as camadas posteriores não sejam executadas, `from_pretrained` ainda inicializa/encaminha o checkpoint inteiro e pode descarregar pesos em CPU/disco; portanto, o carregamento inicial ainda custa tempo. A interrupção reduz o cálculo do forward. Essa é uma aproximação funcional melhor que comparar apenas os pesos, mas os resultados dependem do texto usado. Um único texto serve para filtrar candidatos; antes de podar, seria necessário confirmar os melhores pares em mais entradas. O script apenas analisa e não modifica o checkpoint.
 
+## Comparação direta: representantes globais, por linha e Q4_0
 
-## Comparação direta: 16 representantes por matriz vs Q4_0
+`compare_representatives_vs_q4.py` compara três representações **da mesma matriz**. Por padrão usa `model.language_model.layers.0.mlp.gate_proj.weight`:
 
-\`compare_representatives_vs_q4.py\` aplica os dois métodos **à mesma matriz**, com o padrão apontando para \`model.language_model.layers.0.mlp.gate_proj.weight\`:
-
-- **Representantes compartilhados:** 16 centros aprendidos na distribuição da matriz; cada posição usa um índice de 4 bits e a tabela FP16 é armazenada uma vez por matriz.
+- **Representantes globais:** 16 valores FP16 aprendidos da distribuição da matriz inteira; cada peso usa um índice de 4 bits.
+- **Representantes por linha:** 16 valores FP16 independentes para cada linha da matriz, também com índices de 4 bits. Essa é a nova variante local, que adiciona custo para o codebook mas adapta os níveis à distribuição de cada linha.
 - **Q4_0:** formato de referência do GGML com blocos de 32 pesos, 16 bytes de índices compactados e uma escala FP16 por bloco — 18 bytes por 32 pesos (4,5 bits/peso). A disposição segue a [documentação do llama.cpp](https://github.com/ggml-org/llama.cpp/wiki/Tensor-Encoding-Schemes).
 
 Execute no PowerShell com o checkpoint local:
 
-\`\`\`powershell
-.\\.venv-smoke\\Scripts\\python.exe compare_representatives_vs_q4.py --model ".\\Qwen3.5-4B" --output-dir representatives_vs_q4_results
-\`\`\`
+```powershell
+.\.venv-smoke\Scripts\python.exe compare_representatives_vs_q4.py --model ".\Qwen3.5-4B" --output-dir representatives_vs_q4_results
+```
 
 Para listar as matrizes ou selecionar outra:
 
-\`\`\`powershell
-.\\.venv-smoke\\Scripts\\python.exe compare_representatives_vs_q4.py --model ".\\Qwen3.5-4B" --list-tensors
-.\\.venv-smoke\\Scripts\\python.exe compare_representatives_vs_q4.py --model ".\\Qwen3.5-4B" --tensor-name "model.language_model.layers.0.mlp.gate_proj.weight"
-\`\`\`
+```powershell
+.\.venv-smoke\Scripts\python.exe compare_representatives_vs_q4.py --model ".\Qwen3.5-4B" --list-tensors
+.\.venv-smoke\Scripts\python.exe compare_representatives_vs_q4.py --model ".\Qwen3.5-4B" --tensor-name "model.language_model.layers.0.mlp.gate_proj.weight"
+```
 
-O relatório \`representatives_vs_q4_report.json\` compara tamanho do payload empacotado, bits por peso, RMSE normalizado pelo desvio-padrão, erro L2 relativo, erro absoluto médio e similaridade cosseno. O método de representantes é reconstruído a partir do mapa de nibbles salvo em memória; Q4_0 é reconstruído a partir dos nibbles e escalas FP16, para que as métricas considerem a precisão efetivamente armazenada.
+O relatório `representatives_vs_q4_report.json` registra tamanho do mapa e das tabelas, bits efetivos por peso, RMSE normalizado pelo desvio-padrão, erro L2 relativo, erro absoluto médio e similaridade cosseno. Os métodos são reconstruídos a partir dos índices empacotados e dos codebooks FP16, para que as métricas reflitam os valores efetivamente armazenados.
 
-**Escopo:** este primeiro confronto compara erro numérico dos pesos, não perplexidade nem velocidade de inferência. Q4_0 é uma base Q4 simples em blocos; não deve ser confundido com Q4_K_M, que usa um formato diferente e pode ter outra qualidade. O payload contabilizado não inclui o cabeçalho de um arquivo contêiner como NPZ.
+Na matriz padrão de 9.216 linhas, com 16 representantes FP16 por linha, o codebook ocupa 294.912 bytes (cerca de 0,295 MB) além do mapa de 4 bits por peso. O programa calcula o custo real a partir das dimensões da matriz, em vez de assumir esse tamanho para todas as matrizes.
 
+**Escopo:** o experimento compara erro numérico dos pesos, não perplexidade, qualidade de geração ou velocidade de inferência. Q4_0 é uma base Q4 simples em blocos; não deve ser confundido com Q4_K_M. O payload contabilizado não inclui cabeçalhos de um contêiner como NPZ.
