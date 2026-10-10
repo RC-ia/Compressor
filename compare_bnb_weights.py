@@ -466,6 +466,22 @@ def main() -> int:
         for export in correction_exports:
             export["stream"] = stack.enter_context(export["map_path"].open("wb"))
 
+        if correction_exports:
+            thresholds_label = ", ".join(
+                f"{export['threshold']:g}" for export in correction_exports
+            )
+            print(
+                f"[correction maps] Gerando {len(correction_exports)} mapa(s), "
+                f"limiares: {thresholds_label}",
+                flush=True,
+            )
+            if min(export["threshold"] for export in correction_exports) <= 0.001:
+                print(
+                    "[correction maps] Aviso: limiar <= 0.001 pode selecionar centenas de milhões "
+                    "de pesos; confira o espaço livre, pois os mapas de vários limiares podem ocupar vários GB.",
+                    flush=True,
+                )
+
         for number, (target_name, source_name) in enumerate(matched, 1):
             target_item = target_index[target_name]
             source_item = source_index[source_name]
