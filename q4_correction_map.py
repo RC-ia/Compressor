@@ -15,7 +15,7 @@ from safetensors import safe_open
 import compress_tensor as base
 
 BLOCK = 32
-DEFAULT_THRESHOLDS = (1.0, 0.8, 0.6, 0.5)
+DEFAULT_THRESHOLDS = (1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)
 
 
 def q4_0_reconstruct_blocks(source: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -62,7 +62,7 @@ def main() -> int:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--thresholds", type=parse_thresholds,
                         default=list(DEFAULT_THRESHOLDS),
-                        help="Absolute-error thresholds, comma-separated (default: 1.0,0.8,0.6,0.5)")
+                        help="Absolute-error thresholds, comma-separated (default: 1.0,0.8,0.6,0.5,0.4,0.3,0.2,0.1)")
     parser.add_argument("--chunk-elements", type=int, default=1_048_576)
     parser.add_argument("--output-dir", default="q4_correction_map_results")
     args = parser.parse_args()
