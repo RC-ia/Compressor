@@ -389,6 +389,25 @@ O arquivo `neuron_activation_report.json` registra quantos pares têm correlaç�
 
 Embora as camadas posteriores não sejam executadas, `from_pretrained` ainda inicializa/encaminha o checkpoint inteiro e pode descarregar pesos em CPU/disco; portanto, o carregamento inicial ainda custa tempo. A interrupção reduz o cálculo do forward. Essa é uma aproximação funcional melhor que comparar apenas os pesos, mas os resultados dependem do texto usado. Um único texto serve para filtrar candidatos; antes de podar, seria necessário confirmar os melhores pares em mais entradas. O script apenas analisa e não modifica o checkpoint.
 
+## Segundo teste: pesos com erro absoluto maior que um limite
+
+`q4_weight_deviation.py` agora aceita `--error-threshold` (padrão `1.0`) e salva **todos** os pesos em que `abs(Q4_reconstruído - BF16_original) > limite`. A comparação usa o erro absoluto individual, não médias, RMSE ou desvio-padrão. O valor 1.0 é aplicado nas mesmas unidades numéricas dos pesos.
+
+```powershell
+.\.venv-smoke\Scripts\python.exe q4_weight_deviation.py `
+  --model ".\Qwen3.5-4B" `
+  --error-threshold 1.0 `
+  --output-dir q4_error_gt_1_results
+```
+
+O comando produz:
+- `weights_above_threshold.csv`: **cada peso** com erro absoluto estritamente maior que 1.0, mostrando índice, coordenadas, valor de origem, valor Q4 reconstruído e diferença.
+- `blocks_above_threshold.csv`: cada bloco Q4_0 com pelo menos um peso acima de 1.0, quantos pesos ultrapassaram o limite e quais posições locais foram afetadas.
+- `tensor_threshold_counts.csv`: quantos pesos e blocos ultrapassam o limite em cada tensor, inclusive tensores com zero ocorrências.
+- `report.json`: contagem global de pesos, blocos e tensores que ultrapassaram o limite.
+
+Para mudar o limite, use por exemplo `--error-threshold 0.5` ou `--error-threshold 2.0`. O teste ainda usa a simulação Q4_0 existente e só processa tensores alinháveis a blocos de 32 sem cruzar as fronteiras das linhas; veja `skipped_tensors.json` para a lista excluída. Os resultados permitem selecionar posições para um mapa de correções, mas um erro numérico alto não prova sozinho que aquele peso cause grande impacto na saída do modelo.
+
 ## Mapa dos desvios individuais BF16 -> Q4_0
 
 O script `q4_weight_deviation.py` foi criado para localizar os pesos que mais mudam na quantização, sem classificar a perda por média, RMSE ou desvio-padrão. Ele compara cada valor do Safetensors original com o valor reconstruído após Q4_0 e registra a posição exata, o delta assinado e o erro absoluto.
