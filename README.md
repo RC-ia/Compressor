@@ -382,9 +382,35 @@ O relatório `neuron_similarity_report.json` conta pares nos quais **todos os tr
 .\.venv-smoke\Scripts\python.exe analyze_neuron_activations.py --model ".\Qwen3.5-4B" --layer-index 0 --max-tokens 256 --output-dir neuron_activation_results
 
 # Usar texto local para melhorar a amostra de calibração, sem executar geração
-.\.venv-smoke\Scripts\python.exe analyze_neuron_activations.py --model ".\Qwen3.5-4B" --layer-index 0 --text-file ".\calibration.txt" --max-tokens 512
+.\.venv-smoke\Scripts\python.exe analyze_neuron_activations.py --model ".\Qwen3.5-4B" --layer-index 0 --text-file ".\calibration_multilingual.txt" --max-tokens 512
 ```
 
 O arquivo `neuron_activation_report.json` registra quantos pares têm correlação absoluta de ativação acima de 0,90, 0,95, 0,98 e 0,99, além dos melhores pares. Para cada candidato, estima o erro na contribuição combinada dos dois neurônios e uma estimativa do erro relativo perante a saída total da MLP se um fosse absorvido no outro.
 
 Embora as camadas posteriores não sejam executadas, `from_pretrained` ainda inicializa/encaminha o checkpoint inteiro e pode descarregar pesos em CPU/disco; portanto, o carregamento inicial ainda custa tempo. A interrupção reduz o cálculo do forward. Essa é uma aproximação funcional melhor que comparar apenas os pesos, mas os resultados dependem do texto usado. Um único texto serve para filtrar candidatos; antes de podar, seria necessário confirmar os melhores pares em mais entradas. O script apenas analisa e não modifica o checkpoint.
+
+
+## Comparação direta: 16 representantes por matriz vs Q4_0
+
+\`compare_representatives_vs_q4.py\` aplica os dois métodos **à mesma matriz**, com o padrão apontando para \`model.language_model.layers.0.mlp.gate_proj.weight\`:
+
+- **Representantes compartilhados:** 16 centros aprendidos na distribuição da matriz; cada posição usa um índice de 4 bits e a tabela FP16 é armazenada uma vez por matriz.
+- **Q4_0:** formato de referência do GGML com blocos de 32 pesos, 16 bytes de índices compactados e uma escala FP16 por bloco — 18 bytes por 32 pesos (4,5 bits/peso). A disposição segue a [documentação do llama.cpp](https://github.com/ggml-org/llama.cpp/wiki/Tensor-Encoding-Schemes).
+
+Execute no PowerShell com o checkpoint local:
+
+\`\`\`powershell
+.\\.venv-smoke\\Scripts\\python.exe compare_representatives_vs_q4.py --model ".\\Qwen3.5-4B" --output-dir representatives_vs_q4_results
+\`\`\`
+
+Para listar as matrizes ou selecionar outra:
+
+\`\`\`powershell
+.\\.venv-smoke\\Scripts\\python.exe compare_representatives_vs_q4.py --model ".\\Qwen3.5-4B" --list-tensors
+.\\.venv-smoke\\Scripts\\python.exe compare_representatives_vs_q4.py --model ".\\Qwen3.5-4B" --tensor-name "model.language_model.layers.0.mlp.gate_proj.weight"
+\`\`\`
+
+O relatório \`representatives_vs_q4_report.json\` compara tamanho do payload empacotado, bits por peso, RMSE normalizado pelo desvio-padrão, erro L2 relativo, erro absoluto médio e similaridade cosseno. O método de representantes é reconstruído a partir do mapa de nibbles salvo em memória; Q4_0 é reconstruído a partir dos nibbles e escalas FP16, para que as métricas considerem a precisão efetivamente armazenada.
+
+**Escopo:** este primeiro confronto compara erro numérico dos pesos, não perplexidade nem velocidade de inferência. Q4_0 é uma base Q4 simples em blocos; não deve ser confundido com Q4_K_M, que usa um formato diferente e pode ter outra qualidade. O payload contabilizado não inclui o cabeçalho de um arquivo contêiner como NPZ.
+
