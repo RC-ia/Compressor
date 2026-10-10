@@ -389,6 +389,33 @@ O arquivo `neuron_activation_report.json` registra quantos pares têm correlaç�
 
 Embora as camadas posteriores não sejam executadas, `from_pretrained` ainda inicializa/encaminha o checkpoint inteiro e pode descarregar pesos em CPU/disco; portanto, o carregamento inicial ainda custa tempo. A interrupção reduz o cálculo do forward. Essa é uma aproximação funcional melhor que comparar apenas os pesos, mas os resultados dependem do texto usado. Um único texto serve para filtrar candidatos; antes de podar, seria necessário confirmar os melhores pares em mais entradas. O script apenas analisa e não modifica o checkpoint.
 
+## Mapa dos desvios individuais BF16 -> Q4_0
+
+O script `q4_weight_deviation.py` foi criado para localizar os pesos que mais mudam na quantização, sem classificar a perda por média, RMSE ou desvio-padrão. Ele compara cada valor do Safetensors original com o valor reconstruído após Q4_0 e registra a posição exata, o delta assinado e o erro absoluto.
+
+No PowerShell, analise todos os tensores elegíveis:
+
+```powershell
+.\.venv-smoke\Scripts\python.exe q4_weight_deviation.py --model ".\Qwen3.5-4B" --output-dir q4_weight_deviation_results
+```
+
+Saídas principais:
+
+- `top_weight_deviations.csv`: os pesos individuais com maior diferença absoluta em todo o modelo, incluindo tensor, coordenadas, valor BF16, valor Q4 reconstruído e delta.
+- `top_block_deviations.csv`: blocos de 32 pesos ordenados pelo pior peso de cada bloco.
+- `worst_weight_per_tensor.csv`: o peso que mais se desviou dentro de cada tensor.
+- `report.json` e `skipped_tensors.json`: escopo e tensores que não foram tratados como Q4_0 porque o tamanho não é múltiplo de 32.
+
+Para obter o erro de **cada peso** em uma matriz específica (o CSV pode ficar grande):
+
+```powershell
+.\.venv-smoke\Scripts\python.exe q4_weight_deviation.py --model ".\Qwen3.5-4B" --tensor-name "model.language_model.layers.0.mlp.gate_proj.weight" --dump-all-weights --output-dir gate_proj_q4_deviation
+```
+
+Esse modo gera também `all_weight_errors.csv`, com uma linha por peso e seu índice/posição. `--top-k 2000` aumenta a quantidade de piores pesos e blocos listados. Use o nome exato do tensor retornado pelo script existente `compare_representatives_vs_q4.py --list-tensors`.
+
+**Importante:** este teste quantiza os valores BF16 de origem com uma implementação Q4_0 em blocos e reconstrói os valores armazenados (inclusive a escala FP16); ele não lê nem decodifica um arquivo GGUF Q4 externo. As métricas de ranking são por peso/bloco, sem médias globais.
+
 ## Comparação direta: representantes globais, por linha e Q4_0
 
 `compare_representatives_vs_q4.py` compara três representações **da mesma matriz**. Por padrão usa `model.language_model.layers.0.mlp.gate_proj.weight`:
