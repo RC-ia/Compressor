@@ -541,11 +541,11 @@ Execute usando os arquivos criados pelo comando `compare_bnb_weights.py --export
   --manifest ".\bnb_weight_validation\correction_map_manifest.json" `
   --prompt "Explique brevemente por que o céu parece azul." `
   --max-new-tokens 48 `
-  --device-map auto `
+  --device-map gpu `
   --compute-dtype float16 `
   --output ".\bnb_weight_validation\correction_runtime_test.json"
 ```
 
-O script valida cada tensor do manifesto contra um módulo de mesmo nome, tipo `Linear4bit` e dimensões compatíveis. Se alguma correção não puder ser associada, ele interrompe em vez de ignorá-la silenciosamente. O JSON de saída inclui quantidade de hooks, diferença máxima/RMSE dos logits, mudança do próximo token, textos gerados sem/com mapa e tempos de geração.
+O script valida cada tensor do manifesto contra um módulo de mesmo nome, tipo `Linear4bit` e dimensões compatíveis. Se alguma correção não puder ser associada, ele interrompe em vez de ignorá-la silenciosamente. Por padrão, `--device-map gpu` força o modelo inteiro para CUDA 0 para evitar o erro do bitsandbytes 4-bit quando `device_map="auto"` envia módulos para CPU/disco. Isso pode causar CUDA OOM se a VRAM livre não for suficiente; nesse caso, o modelo não será automaticamente dividido entre CPU e GPU. O carregador também modifica a configuração NF4 em memória para usar o dtype escolhido, sem passar uma segunda `quantization_config` que seria ignorada pelo Transformers. O JSON de saída inclui quantidade de hooks, diferença máxima/RMSE dos logits, mudança do próximo token, textos gerados sem/com mapa e tempos de geração.
 
 **Limitação:** o hook implementa a contribuição esparsa por gathers e `scatter_add`; adiciona trabalho em cada camada com correções e pode reduzir a velocidade, especialmente durante geração token a token. Primeiro valide a correção e o resultado numérico; otimização de desempenho é uma etapa posterior. O teste usa um único prompt e não substitui avaliação de perplexidade ou de qualidade em um conjunto de tarefas.
