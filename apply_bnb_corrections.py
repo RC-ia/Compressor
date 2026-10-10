@@ -8,6 +8,7 @@ exported by compare_bnb_weights.py.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import struct
@@ -278,7 +279,7 @@ def choose_input_device(model: nn.Module) -> torch.device:
 
 
 def compare_logits(model: nn.Module, inputs: dict[str, torch.Tensor],
-                   state: dict[str, bool]) -> dict[str, Any]:
+                   state: dict[str, bool]) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
     state["enabled"] = False
     with torch.inference_mode():
         baseline = model(**inputs, use_cache=False).logits[:, -1, :].float().cpu()
@@ -291,13 +292,46 @@ def compare_logits(model: nn.Module, inputs: dict[str, torch.Tensor],
     b = corrected.reshape(-1).double()
     dot = float(torch.dot(a, b))
     norm = float(torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b))
-    return {
+    metrics = {
         "max_abs_logit_difference": float(diff.abs().max()),
         "rmse_logit_difference": float(torch.mean(diff.double() ** 2).sqrt()),
         "argmax_changed": int(baseline.argmax(dim=-1).item() != corrected.argmax(dim=-1).item()),
         "baseline_top_token_id": int(baseline.argmax(dim=-1).item()),
         "corrected_top_token_id": int(corrected.argmax(dim=-1).item()),
         "logit_cosine_similarity": dot / norm if norm else None,
+    }
+    return metrics, baseline, corrected
+
+
+def compare_candidate_to_reference(
+    candidate: torch.Tensor, reference: torch.Tensor
+) -> dict[str, Any]:
+    if candidate.shape != reference.shape:
+        raise ValueError(
+            "Os logits têm dimensões diferentes: "
+            f"candidato={tuple(candidate.shape)}, referência={tuple(reference.shape)}. "
+            "Confirme se os dois checkpoints têm o mesmo vocabulário."
+        )
+    candidate64 = candidate.reshape(-1).double()
+    reference64 = reference.reshape(-1).double()
+    diff = candidate64 - reference64
+    rmse = float(torch.mean(diff.square()).sqrt())
+    reference_std = float(reference64.std(unbiased=False))
+    candidate_norm = float(torch.linalg.vector_norm(candidate64))
+    reference_norm = float(torch.linalg.vector_norm(reference64))
+    denominator = candidate_norm * reference_norm
+    cosine = float(torch.dot(candidate64, reference64) / denominator) if denominator else None
+    candidate_top = int(candidate.argmax(dim=-1).item())
+    reference_top = int(reference.argmax(dim=-1).item())
+    return {
+        "rmse_to_reference": rmse,
+        "mae_to_reference": float(diff.abs().mean()),
+        "max_abs_difference_to_reference": float(diff.abs().max()),
+        "rmse_over_reference_logit_std": rmse / reference_std if reference_std else None,
+        "cosine_similarity_to_reference": cosine,
+        "top_token_id": candidate_top,
+        "reference_top_token_id": reference_top,
+        "top_token_matches_reference": candidate_top == reference_top,
     }
 
 
@@ -338,6 +372,23 @@ def main() -> int:
     parser.add_argument("--max-temp-elements", type=int, default=1_000_000,
                         help="Limite aproximado para o buffer temporário tokens x correções.")
     parser.add_argument("--output", default="bnb_correction_runtime_test.json")
+    parser.add_argument(
+        "--reference-model", default=None,
+        help="Checkpoint BF16 original do MESMO backbone textual (ex.: techwithsergiu/Qwen3.5-text-4B). "
+             "Quando informado, mede se os logits corrigidos ficam mais próximos dele."
+    )
+    parser.add_argument(
+        "--reference-dtype", choices=["auto", "bfloat16", "float16", "float32"], default="auto",
+        help="'auto' preserva o dtype declarado no checkpoint; use bfloat16 para forçar BF16."
+    )
+    parser.add_argument(
+        "--reference-max-cpu-memory", default="4GiB",
+        help="Limite de RAM reservado ao modelo de referência; o excedente será enviado para disco (padrão: 4GiB)."
+    )
+    parser.add_argument(
+        "--reference-offload-folder", default=None,
+        help="Pasta para pesos temporários do modelo BF16 enviados ao disco. Padrão: <pasta do relatório>/bf16_offload."
+    )
     args = parser.parse_args()
 
     if Linear4bit is None:
@@ -410,7 +461,7 @@ def main() -> int:
     inputs = {key: value.to(input_device) for key, value in inputs.items()}
 
     print("Comparando logits antes/depois ...", flush=True)
-    logit_metrics = compare_logits(model, inputs, state)
+    logit_metrics, baseline_logits, corrected_logits = compare_logits(model, inputs, state)
     print(json.dumps(logit_metrics, ensure_ascii=False, indent=2), flush=True)
 
     baseline_text, baseline_seconds = generate_once(
@@ -419,6 +470,96 @@ def main() -> int:
     corrected_text, corrected_seconds = generate_once(
         model, tokenizer, inputs, state, True, args.max_new_tokens
     )
+
+    quantized_device_map = getattr(model, "hf_device_map", {})
+    reference_comparison = None
+
+    if args.reference_model:
+        print("\\nLiberando o NF4 antes de carregar a referência BF16 ...", flush=True)
+        reference_inputs_cpu = {key: value.detach().cpu() for key, value in inputs.items()}
+        for handle in handles:
+            handle.remove()
+        for record in records:
+            record.pop("_device_cache", None)
+        del inputs
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        reference_dtype_map = {
+            "auto": "auto",
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }
+        output_parent = Path(args.output).expanduser().resolve().parent
+        offload_folder = (
+            Path(args.reference_offload_folder).expanduser().resolve()
+            if args.reference_offload_folder
+            else output_parent / "bf16_offload"
+        )
+        offload_folder.mkdir(parents=True, exist_ok=True)
+        print(
+            f"Carregando referência {args.reference_model} com dtype={args.reference_dtype}; "
+            f"limite de RAM={args.reference_max_cpu_memory}. "
+            "Atenção: camadas excedentes serão temporariamente armazenadas em disco.",
+            flush=True,
+        )
+        reference_model = AutoModelForCausalLM.from_pretrained(
+            args.reference_model,
+            device_map="auto",
+            max_memory={"cpu": args.reference_max_cpu_memory},
+            offload_folder=str(offload_folder),
+            offload_state_dict=True,
+            dtype=reference_dtype_map[args.reference_dtype],
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        reference_model.eval()
+        reference_device_map = getattr(reference_model, "hf_device_map", {})
+        reference_input_device = choose_input_device(reference_model)
+        reference_inputs = {
+            key: value.to(reference_input_device)
+            for key, value in reference_inputs_cpu.items()
+        }
+        print(f"Dispositivo de entrada da referência: {reference_input_device}", flush=True)
+        with torch.inference_mode():
+            reference_logits = (
+                reference_model(**reference_inputs, use_cache=False)
+                .logits[:, -1, :].float().cpu()
+            )
+        base_vs_reference = compare_candidate_to_reference(baseline_logits, reference_logits)
+        corrected_vs_reference = compare_candidate_to_reference(corrected_logits, reference_logits)
+        base_rmse = base_vs_reference["rmse_to_reference"]
+        corrected_rmse = corrected_vs_reference["rmse_to_reference"]
+        improvement_percent = (
+            (base_rmse - corrected_rmse) / base_rmse * 100.0 if base_rmse else None
+        )
+        reference_input_dtype = str(reference_model.get_input_embeddings().weight.dtype)
+        reference_comparison = {
+            "reference_model": args.reference_model,
+            "requested_reference_dtype": args.reference_dtype,
+            "reference_embedding_dtype": reference_input_dtype,
+            "reference_device_map": reference_device_map,
+            "reference_offload_folder": str(offload_folder),
+            "reference_max_cpu_memory": args.reference_max_cpu_memory,
+            "comparison_scope": "logits do último token de entrada",
+            "nf4_vs_reference": base_vs_reference,
+            "corrected_vs_reference": corrected_vs_reference,
+            "correction_rmse_improvement_percent": improvement_percent,
+            "closer_to_reference": (
+                corrected_rmse < base_rmse
+            ),
+            "interpretation": (
+                "Positivo em correction_rmse_improvement_percent significa que a correção "
+                "reduziu o RMSE dos logits em relação à referência; negativo significa piora."
+            ),
+        }
+        print("\\n=== COMPARAÇÃO CONTRA A REFERÊNCIA ===", flush=True)
+        print(json.dumps(reference_comparison, ensure_ascii=False, indent=2), flush=True)
+        del reference_inputs, reference_inputs_cpu, reference_logits, reference_model
+        gc.collect()
 
     report = {
         "model": args.model,
@@ -433,8 +574,9 @@ def main() -> int:
         "max_new_tokens": args.max_new_tokens,
         "compute_dtype": args.compute_dtype,
         "requested_device_map": args.device_map,
-        "actual_device_map": getattr(model, "hf_device_map", {}),
+        "actual_device_map": quantized_device_map,
         "logit_comparison": logit_metrics,
+        "reference_comparison": reference_comparison,
         "baseline_generation": baseline_text,
         "corrected_generation": corrected_text,
         "baseline_generation_seconds": baseline_seconds,
