@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 try:
     from bitsandbytes.nn import Linear4bit
@@ -302,6 +302,9 @@ def main() -> int:
     parser.add_argument("--prompt", default="Explique brevemente por que o céu parece azul.")
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--device-map", default="auto", help="Valor passado ao from_pretrained; padrão auto.")
+    parser.add_argument("--compute-dtype", choices=["float16", "bfloat16", "float32"],
+                        default="float16",
+                        help="Precisão de cálculo das camadas NF4; float16 é o padrão para GPUs Pascal/GTX 10.")
     parser.add_argument("--max-temp-elements", type=int, default=1_000_000,
                         help="Limite aproximado para o buffer temporário tokens x correções.")
     parser.add_argument("--output", default="bnb_correction_runtime_test.json")
@@ -323,9 +326,23 @@ def main() -> int:
 
     print(f"Carregando modelo {args.model} ...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    compute_dtypes = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=compute_dtypes[args.compute_dtype],
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_storage=torch.uint8,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map=args.device_map,
+        torch_dtype=compute_dtypes[args.compute_dtype],
+        quantization_config=quantization_config,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
@@ -363,6 +380,7 @@ def main() -> int:
         "hook_stats": hook_stats,
         "prompt": args.prompt,
         "max_new_tokens": args.max_new_tokens,
+        "compute_dtype": args.compute_dtype,
         "logit_comparison": logit_metrics,
         "baseline_generation": baseline_text,
         "corrected_generation": corrected_text,
