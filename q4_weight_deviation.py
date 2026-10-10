@@ -174,12 +174,18 @@ def main() -> int:
             name = item["name"]
             shape = tuple(int(x) for x in item["shape"])
             numel = int(item["numel"])
+            row_width = shape[-1] if shape else 0
+            reason = None
             if not shape or numel % BLOCK:
+                reason = "tensor size is not divisible by Q4_0 block size 32"
+            elif len(shape) > 1 and row_width % BLOCK:
+                reason = "last dimension is not divisible by 32; Q4_0 row blocks cannot be aligned safely"
+            if reason:
                 skipped.append({
                     "tensor": name,
                     "shape": list(shape),
                     "num_weights": numel,
-                    "reason": "not divisible by Q4_0 block size 32 (not processed as Q4_0)",
+                    "reason": reason,
                 })
                 continue
 
@@ -374,7 +380,7 @@ def main() -> int:
             "top_weight_deviations.csv": "Worst individual weights across the analyzed model/tensor, ranked by absolute BF16-to-Q4 difference.",
             "top_block_deviations.csv": "Worst 32-weight Q4_0 blocks, ranked by the largest single weight error in each block.",
             "worst_weight_per_tensor.csv": "The single most changed weight in every analyzed tensor.",
-            "skipped_tensors.json": "Tensors not divisible by the Q4_0 block size of 32; they were not treated as Q4_0.",
+            "skipped_tensors.json": "Tensors that cannot be aligned to Q4_0 blocks of 32 without crossing row boundaries.",
             "all_weight_errors.csv": "Present only with --dump-all-weights and --tensor-name; exact per-weight detail for that selected tensor."
         },
         "skipped_tensors": skipped,
