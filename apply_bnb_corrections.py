@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+from array import array
 import math
 import struct
 import time
@@ -79,8 +80,9 @@ def load_map(
 
         position = start
         previous_index = -1
-        indices: list[int] = []
-        residuals: list[float] = []
+        # Packed buffers avoid multi-GB Python-object overhead on the 0.004 map.
+        indices = array("I")
+        residuals = array("f")
         for _ in range(count):
             delta, position = read_uvarint(data, position, end)
             if delta <= 0:
@@ -94,6 +96,8 @@ def load_map(
                 raise ValueError(f"{tensor_name}: falta resíduo FP16 no mapa.")
             residual = struct.unpack_from("<e", data, position)[0]
             position += 2
+            if flat_index > 0xFFFFFFFF:
+                raise ValueError(f"{tensor_name}: índice {flat_index} excede uint32.")
             indices.append(flat_index)
             residuals.append(float(residual))
             previous_index = flat_index
@@ -103,18 +107,24 @@ def load_map(
                 f"{tensor_name}: {end - position} bytes sobrando na seção do tensor."
             )
 
-        index_tensor = torch.tensor(indices, dtype=torch.long)
-        residual_tensor = torch.tensor(residuals, dtype=torch.float32)
+        if indices.itemsize != 4 or residuals.itemsize != 4:
+            raise RuntimeError("array('I') e array('f') precisam usar 32 bits.")
+        index_tensor = torch.frombuffer(indices, dtype=torch.int32).to(dtype=torch.long)
+        residual_tensor = torch.frombuffer(residuals, dtype=torch.float32)
         out_features, in_features = shape
+        rows = torch.div(index_tensor, in_features, rounding_mode="floor")
+        cols = torch.remainder(index_tensor, in_features)
+        del index_tensor, indices
         records.append({
             "tensor": tensor_name,
             "module": tensor_name[:-7] if tensor_name.endswith(".weight") else tensor_name,
             "shape": shape,
             "out_features": out_features,
             "in_features": in_features,
-            "rows": torch.div(index_tensor, in_features, rounding_mode="floor"),
-            "cols": torch.remainder(index_tensor, in_features),
+            "rows": rows,
+            "cols": cols,
             "values": residual_tensor,
+            "_values_buffer": residuals,
             "count": count,
         })
 
@@ -278,11 +288,18 @@ def choose_input_device(model: nn.Module) -> torch.device:
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def compare_logits(model: nn.Module, inputs: dict[str, torch.Tensor],
-                   state: dict[str, bool]) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
+def compare_logits(
+    model: nn.Module,
+    inputs: dict[str, torch.Tensor],
+    state: dict[str, bool],
+    baseline_logits: torch.Tensor | None = None,
+) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
     state["enabled"] = False
-    with torch.inference_mode():
-        baseline = model(**inputs, use_cache=False).logits[:, -1, :].float().cpu()
+    if baseline_logits is None:
+        with torch.inference_mode():
+            baseline = model(**inputs, use_cache=False).logits[:, -1, :].float().cpu()
+    else:
+        baseline = baseline_logits
     state["enabled"] = True
     with torch.inference_mode():
         corrected = model(**inputs, use_cache=False).logits[:, -1, :].float().cpu()
@@ -358,8 +375,14 @@ def generate_once(model: nn.Module, tokenizer: Any, inputs: dict[str, torch.Tens
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="techwithsergiu/Qwen3.5-text-4B-bnb-4bit")
-    parser.add_argument("--map-file", required=True, help="correction_map_gt_*.bin gerado pelo comparador.")
-    parser.add_argument("--manifest", required=True, help="correction_map_manifest.json correspondente.")
+    parser.add_argument(
+        "--map-file", action="append", required=True,
+        help="Mapa correction_map_gt_*.bin; repita a opção para testar vários mapas."
+    )
+    parser.add_argument(
+        "--manifest", action="append", required=True,
+        help="Manifesto para cada --map-file, na mesma ordem; repita a opção."
+    )
     parser.add_argument("--prompt", default="Explique brevemente por que o céu parece azul.")
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument(
@@ -395,15 +418,29 @@ def main() -> int:
         parser.error("bitsandbytes não está instalado ou Linear4bit não pôde ser importado.")
     if args.max_new_tokens < 1 or args.max_temp_elements < 1:
         parser.error("--max-new-tokens e --max-temp-elements precisam ser positivos.")
+    if len(args.map_file) != len(args.manifest):
+        parser.error("Informe um --manifest para cada --map-file, na mesma ordem.")
 
-    map_path = Path(args.map_file).expanduser().resolve()
-    manifest_path = Path(args.manifest).expanduser().resolve()
-    if not map_path.is_file() or not manifest_path.is_file():
-        parser.error("Não encontrei o mapa ou o manifesto informado.")
-
-    records = load_map(map_path, manifest_path)
-    print(f"Mapa: {map_path} ({map_path.stat().st_size:,} bytes)", flush=True)
-    print(f"Tensores no manifesto: {len(records)} | correções: {sum(r['count'] for r in records):,}", flush=True)
+    map_specs: list[dict[str, Any]] = []
+    for raw_map_path, raw_manifest_path in zip(args.map_file, args.manifest):
+        map_path = Path(raw_map_path).expanduser().resolve()
+        manifest_path = Path(raw_manifest_path).expanduser().resolve()
+        if not map_path.is_file() or not manifest_path.is_file():
+            parser.error(f"Não encontrei o mapa ou manifesto: {map_path} | {manifest_path}")
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        map_specs.append({
+            "map_path": map_path,
+            "manifest_path": manifest_path,
+            "threshold": manifest_payload.get("threshold"),
+            "correction_count": int(manifest_payload.get("correction_count", 0)),
+            "map_bytes": map_path.stat().st_size,
+        })
+        print(
+            f"Mapa preparado (limiar {manifest_payload.get('threshold', 'desconhecido')}): "
+            f"{map_path} ({map_path.stat().st_size:,} bytes; "
+            f"{manifest_payload.get('correction_count', 'contagem desconhecida')} correções)",
+            flush=True,
+        )
 
     print(f"Carregando modelo {args.model} ...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -450,26 +487,80 @@ def main() -> int:
     )
     model.eval()
 
-    state = {"enabled": False}
-    handles, hook_stats = install_hooks(
-        model, records, state, max_temp_elements=args.max_temp_elements
-    )
-    print(f"Hooks instalados: {hook_stats['installed']}", flush=True)
-
     inputs = prompt_inputs(tokenizer, args.prompt)
     input_device = choose_input_device(model)
     inputs = {key: value.to(input_device) for key, value in inputs.items()}
 
-    print("Comparando logits antes/depois ...", flush=True)
-    logit_metrics, baseline_logits, corrected_logits = compare_logits(model, inputs, state)
-    print(json.dumps(logit_metrics, ensure_ascii=False, indent=2), flush=True)
-
+    # Capture NF4 baseline once, without any correction hooks.
+    print("Calculando logits do NF4 sem correções ...", flush=True)
+    state = {"enabled": False}
+    with torch.inference_mode():
+        baseline_logits = model(**inputs, use_cache=False).logits[:, -1, :].float().cpu()
     baseline_text, baseline_seconds = generate_once(
         model, tokenizer, inputs, state, False, args.max_new_tokens
     )
-    corrected_text, corrected_seconds = generate_once(
-        model, tokenizer, inputs, state, True, args.max_new_tokens
-    )
+
+    map_tests: list[dict[str, Any]] = []
+    corrected_logits_by_map: list[torch.Tensor] = []
+    for map_index, spec in enumerate(map_specs, 1):
+        map_path = spec["map_path"]
+        manifest_path = spec["manifest_path"]
+        print(
+            f"\\n=== MAPA {map_index}/{len(map_specs)} (limiar {spec['threshold']}) ===",
+            flush=True,
+        )
+        records = load_map(map_path, manifest_path)
+        loaded_count = sum(record["count"] for record in records)
+        if loaded_count != spec["correction_count"]:
+            raise ValueError(
+                f"Contagem divergente no mapa {map_path}: "
+                f"manifesto={spec['correction_count']}, decodificado={loaded_count}."
+            )
+
+        state = {"enabled": False}
+        handles, hook_stats = install_hooks(
+            model, records, state, max_temp_elements=args.max_temp_elements
+        )
+        print(
+            f"Registros decodificados: {loaded_count:,} | hooks: {hook_stats['installed']}; "
+            "calculando logits corrigidos ...",
+            flush=True,
+        )
+        logit_metrics, _, corrected_logits = compare_logits(
+            model, inputs, state, baseline_logits=baseline_logits
+        )
+        print(json.dumps(logit_metrics, ensure_ascii=False, indent=2), flush=True)
+        corrected_text, corrected_seconds = generate_once(
+            model, tokenizer, inputs, state, True, args.max_new_tokens
+        )
+
+        map_tests.append({
+            "map_file": str(map_path),
+            "manifest_file": str(manifest_path),
+            "map_bytes": spec["map_bytes"],
+            "correction_threshold": spec["threshold"],
+            "tensor_count": len(records),
+            "correction_count": loaded_count,
+            "hook_stats": hook_stats,
+            "logit_comparison": logit_metrics,
+            "corrected_generation": corrected_text,
+            "corrected_generation_seconds": corrected_seconds,
+            "generation_seconds_ratio_corrected_over_baseline": (
+                corrected_seconds / baseline_seconds if baseline_seconds else None
+            ),
+        })
+        corrected_logits_by_map.append(corrected_logits)
+
+        # Only one sparse map resides in memory/VRAM at a time.
+        for handle in handles:
+            handle.remove()
+        for record in records:
+            record.pop("_device_cache", None)
+            record.pop("_values_buffer", None)
+        del records, handles, corrected_logits
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     quantized_device_map = getattr(model, "hf_device_map", {})
     reference_comparison = None
@@ -477,10 +568,6 @@ def main() -> int:
     if args.reference_model:
         print("\nLiberando o NF4 antes de carregar a referência BF16 ...", flush=True)
         reference_inputs_cpu = {key: value.detach().cpu() for key, value in inputs.items()}
-        for handle in handles:
-            handle.remove()
-        for record in records:
-            record.pop("_device_cache", None)
         del inputs
         del model
         gc.collect()
@@ -532,12 +619,26 @@ def main() -> int:
                 .logits[:, -1, :].float().cpu()
             )
         base_vs_reference = compare_candidate_to_reference(baseline_logits, reference_logits)
-        corrected_vs_reference = compare_candidate_to_reference(corrected_logits, reference_logits)
-        base_rmse = base_vs_reference["rmse_to_reference"]
-        corrected_rmse = corrected_vs_reference["rmse_to_reference"]
-        improvement_percent = (
-            (base_rmse - corrected_rmse) / base_rmse * 100.0 if base_rmse else None
-        )
+        map_reference_results: list[dict[str, Any]] = []
+        for test_result, corrected_logits in zip(map_tests, corrected_logits_by_map):
+            corrected_vs_reference = compare_candidate_to_reference(
+                corrected_logits, reference_logits
+            )
+            base_rmse = base_vs_reference["rmse_to_reference"]
+            corrected_rmse = corrected_vs_reference["rmse_to_reference"]
+            improvement_percent = (
+                (base_rmse - corrected_rmse) / base_rmse * 100.0 if base_rmse else None
+            )
+            per_map_reference = {
+                "map_file": test_result["map_file"],
+                "threshold": test_result["correction_threshold"],
+                "corrected_vs_reference": corrected_vs_reference,
+                "correction_rmse_improvement_percent": improvement_percent,
+                "closer_to_reference": corrected_rmse < base_rmse,
+            }
+            test_result["reference_comparison"] = per_map_reference
+            map_reference_results.append(per_map_reference)
+
         reference_input_dtype = str(reference_model.get_input_embeddings().weight.dtype)
         reference_comparison = {
             "reference_model": args.reference_model,
@@ -548,14 +649,11 @@ def main() -> int:
             "reference_max_cpu_memory": args.reference_max_cpu_memory,
             "comparison_scope": "logits do último token de entrada",
             "nf4_vs_reference": base_vs_reference,
-            "corrected_vs_reference": corrected_vs_reference,
-            "correction_rmse_improvement_percent": improvement_percent,
-            "closer_to_reference": (
-                corrected_rmse < base_rmse
-            ),
+            "maps_vs_reference": map_reference_results,
             "interpretation": (
-                "Positivo em correction_rmse_improvement_percent significa que a correção "
-                "reduziu o RMSE dos logits em relação à referência; negativo significa piora."
+                "Em cada mapa, correction_rmse_improvement_percent positivo significa que "
+                "os logits corrigidos ficaram mais próximos da referência BF16 pelo RMSE; "
+                "negativo significa que ficaram mais distantes."
             ),
         }
         print("\n=== COMPARAÇÃO CONTRA A REFERÊNCIA ===", flush=True)
@@ -563,41 +661,55 @@ def main() -> int:
         del reference_inputs, reference_inputs_cpu, reference_logits, reference_model
         gc.collect()
 
+    first_test = map_tests[0]
     report = {
         "model": args.model,
-        "map_file": str(map_path),
-        "manifest_file": str(manifest_path),
-        "map_bytes": map_path.stat().st_size,
-        "correction_threshold": json.loads(manifest_path.read_text(encoding="utf-8")).get("threshold"),
-        "tensor_count": len(records),
-        "correction_count": sum(record["count"] for record in records),
-        "hook_stats": hook_stats,
+        "map_file": first_test["map_file"],
+        "manifest_file": first_test["manifest_file"],
+        "map_bytes": first_test["map_bytes"],
+        "correction_threshold": first_test["correction_threshold"],
+        "tensor_count": first_test["tensor_count"],
+        "correction_count": first_test["correction_count"],
+        "hook_stats": first_test["hook_stats"],
         "prompt": args.prompt,
         "max_new_tokens": args.max_new_tokens,
         "compute_dtype": args.compute_dtype,
         "requested_device_map": args.device_map,
         "actual_device_map": quantized_device_map,
-        "logit_comparison": logit_metrics,
+        "logit_comparison": first_test["logit_comparison"],
         "reference_comparison": reference_comparison,
         "baseline_generation": baseline_text,
-        "corrected_generation": corrected_text,
+        "corrected_generation": first_test["corrected_generation"],
         "baseline_generation_seconds": baseline_seconds,
-        "corrected_generation_seconds": corrected_seconds,
+        "corrected_generation_seconds": first_test["corrected_generation_seconds"],
         "generation_seconds_ratio_corrected_over_baseline": (
-            corrected_seconds / baseline_seconds if baseline_seconds else None
+            first_test["generation_seconds_ratio_corrected_over_baseline"]
         ),
-        "note": "Prototype only. It applies sparse residuals through PyTorch forward hooks; it does not rewrite the checkpoint.",
+        "map_tests": map_tests,
+        "all_corrected_generations": [
+            {
+                "threshold": test["correction_threshold"],
+                "map_file": test["map_file"],
+                "text": test["corrected_generation"],
+                "seconds": test["corrected_generation_seconds"],
+            }
+            for test in map_tests
+        ],
+        "note": "Prototype only. Each sparse map is applied independently through PyTorch forward hooks; the original NF4 checkpoint is not rewritten.",
     }
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    for handle in handles:
-        handle.remove()
-
-    print("\n=== RESULTADO DA CORREÇÃO ===")
-    print(f"Base:      {baseline_text}")
-    print(f"Corrigido: {corrected_text}")
-    print(f"Tempo base: {baseline_seconds:.2f}s | corrigido: {corrected_seconds:.2f}s")
+    print("\n=== RESULTADO DOS MAPAS ===")
+    print(f"NF4 sem correção: {baseline_text}")
+    print(f"Tempo base: {baseline_seconds:.2f}s")
+    for test in map_tests:
+        print(
+            f"\nLimiar {test['correction_threshold']}: "
+            f"{test['map_bytes']:,} bytes | {test['correction_count']:,} correções"
+        )
+        print(f"Corrigido: {test['corrected_generation']}")
+        print(f"Tempo corrigido: {test['corrected_generation_seconds']:.2f}s")
     print(f"Relatório: {output_path}")
     return 0
 
