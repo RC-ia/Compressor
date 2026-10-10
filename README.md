@@ -524,3 +524,27 @@ Saídas:
 O mapa auxiliar é apenas exportado: ele **não modifica o checkpoint nem é aplicado automaticamente pelo Transformers**. A aplicação durante a inferência ainda exige um módulo que interprete o manifesto, decodifique as entradas e some a contribuição dos resíduos nas camadas correspondentes.
 
 **Importante:** o script usa a desquantização do bitsandbytes sobre os dados realmente armazenados; não quantiza de novo os pesos de origem. Ele mede diferenças numéricas dos pesos, não perplexidade nem qualidade de geração. Se a desquantização NF4 falhar no backend CUDA instalado, o script interrompe com o nome do tensor em vez de substituir silenciosamente o resultado por uma simulação.
+
+
+## Teste de inferência com o mapa esparso NF4
+
+\`apply_bnb_corrections.py\` carrega o checkpoint BNB NF4 normalmente e instala forward hooks PyTorch nas camadas \`Linear4bit\` listadas em \`correction_map_manifest.json\`. Em cada camada, calcula a contribuição dos resíduos esparsos (\`E @ x\`) e soma essa contribuição à saída quantizada. O checkpoint original não é alterado.
+
+O teste roda uma passagem sem correções e outra com correções, compara os logits do último token e gera texto com ambas as configurações. É um protótipo para validar mapeamento das camadas, efeito numérico e custo de tempo — não uma implementação otimizada para produção.
+
+Execute usando os arquivos criados pelo comando \`compare_bnb_weights.py --export-corrections\`:
+
+\`\`\`powershell
+.\\.venv-smoke\\Scripts\\python.exe apply_bnb_corrections.py \`
+  --model "techwithsergiu/Qwen3.5-text-4B-bnb-4bit" \`
+  --map-file ".\\bnb_weight_validation\\correction_map_gt_0p01.bin" \`
+  --manifest ".\\bnb_weight_validation\\correction_map_manifest.json" \`
+  --prompt "Explique brevemente por que o céu parece azul." \`
+  --max-new-tokens 48 \`
+  --device-map auto \`
+  --output ".\\bnb_weight_validation\\correction_runtime_test.json"
+\`\`\`
+
+O script valida cada tensor do manifesto contra um módulo de mesmo nome, tipo \`Linear4bit\` e dimensões compatíveis. Se alguma correção não puder ser associada, ele interrompe em vez de ignorá-la silenciosamente. O JSON de saída inclui quantidade de hooks, diferença máxima/RMSE dos logits, mudança do próximo token, textos gerados sem/com mapa e tempos de geração.
+
+**Limitação:** o hook implementa a contribuição esparsa por gathers e \`scatter_add\`; adiciona trabalho em cada camada com correções e pode reduzir a velocidade, especialmente durante geração token a token. Primeiro valide a correção e o resultado numérico; otimização de desempenho é uma etapa posterior. O teste usa um único prompt e não substitui avaliação de perplexidade ou de qualidade em um conjunto de tarefas.
