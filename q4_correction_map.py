@@ -177,10 +177,11 @@ def main() -> int:
                             if post_error != 0.0:
                                 corrected_nonzero[t] += 1
                                 nonzero_after[t] += 1
-                            block_global = global_index // BLOCK
-                            if block_global not in affected_blocks[t]:
-                                affected_blocks[t].add(block_global)
-                                tensor_blocks[t].add(block_global)
+                            # Q4_0 block IDs restart at each tensor; do not merge blocks across tensors.
+                            block_key = (tensor_id, local // BLOCK + (chunk_global_start - tensor_offset) // BLOCK)
+                            if block_key not in affected_blocks[t]:
+                                affected_blocks[t].add(block_key)
+                                tensor_blocks[t].add(block_key)
                             # Sparse record: delta-coded global weight index (unsigned LEB128) + FP16 residual.
                             index_delta = global_index - previous_global_index[t]
                             index_bytes = write_uvarint(streams[t], index_delta)
