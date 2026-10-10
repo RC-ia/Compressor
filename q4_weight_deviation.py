@@ -397,7 +397,7 @@ def main() -> int:
     print(f"Tensores quantizados: {len(tensor_maxima)}")
     print(f"Pesos analisados: {total_quantized_weights:,}")
     print(f"Pesos com diferença numérica: {total_nonzero_errors:,}")
-    print(f"Tensores fora do Q4_0 (tamanho não divisível por 32): {len(skipped)}")
+    print(f"Tensores não alinhados ao Q4_0: {len(skipped)}")
     print(f"Top pesos: {output_dir / 'top_weight_deviations.csv'}")
     print(f"Top blocos: {output_dir / 'top_block_deviations.csv'}")
     print(f"Pior peso por tensor: {output_dir / 'worst_weight_per_tensor.csv'}")
