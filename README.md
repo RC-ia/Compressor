@@ -391,12 +391,12 @@ Embora as camadas posteriores não sejam executadas, `from_pretrained` ainda ini
 
 ## Mapa esparso de correções individuais para Q4_0
 
-O script `q4_correction_map.py` compara cada peso de origem com a reconstrução Q4_0 e gera mapas esparsos independentes para os limites absolutos `1.0`, `0.8`, `0.6` e `0.5`. Para cada peso acima do limite, armazena apenas o índice global delta-coded e o resíduo FP16 (`original - Q4`). A correção aplicada é `Q4 + resíduo`; o script mede também o erro restante causado pelo armazenamento do resíduo em FP16.
+O script `q4_correction_map.py` compara cada peso de origem com a reconstrução Q4_0 e gera mapas esparsos independentes para os limites absolutos `1.0`, `0.8`, `0.6`, `0.5`, `0.4`, `0.3`, `0.2` e `0.1`. Para cada peso acima do limite, armazena apenas o índice global delta-coded e o resíduo FP16 (`original - Q4`). A correção aplicada é `Q4 + resíduo`; o script mede também o erro restante causado pelo armazenamento do resíduo em FP16.
 
 ```powershell
 .\.venv-smoke\Scripts\python.exe q4_correction_map.py `
   --model ".\Qwen3.5-4B" `
-  --thresholds 1.0,0.8,0.6,0.5 `
+  --thresholds 1.0,0.8,0.6,0.5,0.4,0.3,0.2,0.1 `
   --output-dir q4_correction_map_results
 ```
 
