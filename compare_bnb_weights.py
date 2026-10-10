@@ -298,6 +298,48 @@ def dequantize_bnb_tensor(
     return restored.detach().to("cpu")
 
 
+def write_correction_records(stream: Any, index_deltas: np.ndarray,
+                             residuals_fp16: np.ndarray) -> None:
+    """Write delta-coded LEB128 indices interleaved with little-endian FP16 residuals.
+
+    Operates on whole NumPy chunks instead of issuing one Python write per weight,
+    which matters for very large, low-threshold sidecars.
+    """
+    deltas = np.asarray(index_deltas, dtype=np.uint64).reshape(-1)
+    residuals = np.ascontiguousarray(
+        np.asarray(residuals_fp16, dtype="<f2").reshape(-1)
+    )
+    if deltas.size != residuals.size:
+        raise ValueError("Índices e resíduos têm quantidades diferentes.")
+    if deltas.size == 0:
+        return
+    if np.any(deltas == 0):
+        raise ValueError("Os deltas dos índices precisam ser positivos.")
+
+    lengths = np.ones(deltas.size, dtype=np.uint8)
+    lengths += (deltas >= (1 << 7)).astype(np.uint8)
+    lengths += (deltas >= (1 << 14)).astype(np.uint8)
+    lengths += (deltas >= (1 << 21)).astype(np.uint8)
+    lengths += (deltas >= (1 << 28)).astype(np.uint8)
+
+    record_lengths = lengths.astype(np.int64) + 2
+    starts = np.cumsum(record_lengths, dtype=np.int64) - record_lengths
+    encoded = np.empty(int(record_lengths.sum()), dtype=np.uint8)
+
+    for byte_index, shift in enumerate((0, 7, 14, 21, 28)):
+        mask = lengths > byte_index
+        if not np.any(mask):
+            continue
+        byte_values = ((deltas[mask] >> shift) & 0x7F).astype(np.uint8)
+        continuation = (lengths[mask] > byte_index + 1).astype(np.uint8) << 7
+        encoded[starts[mask] + byte_index] = byte_values | continuation
+
+    residual_bytes = residuals.view(np.uint8).reshape(-1, 2)
+    encoded[starts + lengths] = residual_bytes[:, 0]
+    encoded[starts + lengths + 1] = residual_bytes[:, 1]
+    stream.write(encoded.tobytes())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compara pesos BF16 com os pesos reais reconstruídos de um checkpoint BNB NF4."
@@ -321,9 +363,18 @@ def main() -> int:
     parser.add_argument("--export-corrections", action="store_true",
                         help="Exportar mapa esparso com os resíduos dos pesos NF4 cujo erro excede --correction-threshold.")
     parser.add_argument("--correction-threshold", type=float, default=0.01,
-                        help="Limite absoluto para exportar correções (padrão: 0.01).")
+                        help="Limite absoluto para exportar um único mapa (padrão: 0.01).")
+    parser.add_argument("--correction-thresholds", type=parse_thresholds, default=None,
+                        help="Exportar vários mapas num único processamento, por exemplo: 0.009,0.008,...,0.001. Ativa automaticamente a exportação.")
     parser.add_argument("--output-dir", default="bnb_weight_validation")
     args = parser.parse_args()
+    multi_threshold_export = args.correction_thresholds is not None
+    correction_thresholds = (
+        args.correction_thresholds
+        if multi_threshold_export else [args.correction_threshold]
+    )
+    if multi_threshold_export:
+        args.export_corrections = True
 
     if args.chunk_elements < 1:
         parser.error("--chunk-elements precisa ser positivo")
@@ -368,8 +419,30 @@ def main() -> int:
     tensor_csv = output / "tensor_comparison.csv"
     top_csv = output / "top_weight_deviations.csv"
     report_path = output / "report.json"
-    correction_map_path = output / f"correction_map_gt_{str(args.correction_threshold).replace('.', 'p')}.bin"
-    correction_manifest_path = output / "correction_map_manifest.json"
+    correction_exports: list[dict[str, Any]] = []
+    if args.export_corrections:
+        for threshold in correction_thresholds:
+            tag = format(threshold, "g").replace(".", "p")
+            map_path = output / f"correction_map_gt_{tag}.bin"
+            manifest_path = (
+                output / f"correction_map_gt_{tag}_manifest.json"
+                if multi_threshold_export else output / "correction_map_manifest.json"
+            )
+            correction_exports.append({
+                "threshold": threshold,
+                "tag": tag,
+                "map_path": map_path,
+                "manifest_path": manifest_path,
+                "tensor_manifest": [],
+                "correction_total": 0,
+                "correction_fp16_error_max": 0.0,
+                "correction_fp16_error_nonzero": 0,
+                "global_abs_sum": 0.0,
+                "global_sq_sum": 0.0,
+                "global_max": 0.0,
+                "global_count": 0,
+                "stream": None,
+            })
 
     if not matched:
         raise RuntimeError(
@@ -386,22 +459,12 @@ def main() -> int:
     unquantized_tensor_count = 0
     shape_mismatches: list[dict[str, Any]] = []
     processed = 0
-    correction_manifest: list[dict[str, Any]] = []
-    correction_total = 0
-    correction_fp16_error_max = 0.0
-    correction_fp16_error_nonzero = 0
-    correction_map_stream = None
-    correction_map_bytes = 0
-    correction_global_abs_sum = 0.0
-    correction_global_sq_sum = 0.0
-    correction_global_max = 0.0
-    correction_global_count = 0
 
     with ExitStack() as stack:
         source_handles = open_safetensors(source_files, stack)
         target_handles = open_safetensors(target_files, stack)
-        if args.export_corrections:
-            correction_map_stream = stack.enter_context(correction_map_path.open("wb"))
+        for export in correction_exports:
+            export["stream"] = stack.enter_context(export["map_path"].open("wb"))
 
         for number, (target_name, source_name) in enumerate(matched, 1):
             target_item = target_index[target_name]
@@ -427,11 +490,16 @@ def main() -> int:
             tensor_metrics = new_metrics(args.thresholds)
             source_dtype = "unknown"
             target_dtype = "unknown"
-            tensor_map_offset = correction_map_stream.tell() if correction_map_stream else 0
-            tensor_correction_count = 0
-            tensor_correction_max_error = 0.0
-            tensor_correction_nonzero_error = 0
-            previous_correction_index = -1
+            tensor_export_states = {
+                export["tag"]: {
+                    "offset": int(export["stream"].tell()),
+                    "count": 0,
+                    "max_error": 0.0,
+                    "nonzero_error": 0,
+                    "previous_index": -1,
+                }
+                for export in correction_exports
+            }
 
             dequantized = None
             if quantized:
@@ -482,63 +550,86 @@ def main() -> int:
                     flat_start, original, reconstructed,
                 )
 
-                if correction_map_stream is not None and quantized:
-                    # Residual is original minus the actually dequantized NF4 value.
+                if correction_exports and quantized:
                     original32 = np.asarray(original, dtype=np.float32).reshape(-1)
                     reconstructed32 = np.asarray(reconstructed, dtype=np.float32).reshape(-1)
                     signed_residual = original32 - reconstructed32
-                    selected = np.flatnonzero(np.abs(signed_residual) > args.correction_threshold)
-                    corrected_abs_errors = np.abs(reconstructed32 - original32)
-                    if selected.size:
-                        for local_raw in selected:
-                            local = int(local_raw)
-                            flat_index = flat_start + local
-                            residual_fp16 = np.float16(signed_residual[local])
-                            index_delta = flat_index - previous_correction_index
-                            write_uvarint(correction_map_stream, index_delta)
-                            correction_map_stream.write(struct.pack("<e", float(residual_fp16)))
-                            previous_correction_index = flat_index
-                            tensor_correction_count += 1
-                            correction_total += 1
+                    base_abs_errors = np.abs(signed_residual)
 
-                            post_error = abs(
-                                float(original32[local])
-                                - (float(reconstructed32[local]) + float(residual_fp16))
-                            )
-                            tensor_correction_max_error = max(
-                                tensor_correction_max_error, post_error
-                            )
-                            correction_fp16_error_max = max(
-                                correction_fp16_error_max, post_error
-                            )
-                            if post_error != 0.0:
-                                tensor_correction_nonzero_error += 1
-                                correction_fp16_error_nonzero += 1
-                            corrected_abs_errors[local] = post_error
+                    for export in correction_exports:
+                        state = tensor_export_states[export["tag"]]
+                        selected = np.flatnonzero(
+                            base_abs_errors > float(export["threshold"])
+                        )
+                        post_errors = base_abs_errors.copy()
 
-                    correction_global_abs_sum += float(np.sum(corrected_abs_errors, dtype=np.float64))
-                    correction_global_sq_sum += float(
-                        np.sum(corrected_abs_errors.astype(np.float64) ** 2, dtype=np.float64)
-                    )
-                    correction_global_max = max(
-                        correction_global_max,
-                        float(corrected_abs_errors.max(initial=0.0)),
-                    )
-                    correction_global_count += int(original32.size)
+                        if selected.size:
+                            flat_indices = selected.astype(np.int64) + flat_start
+                            residual_fp16 = signed_residual[selected].astype(np.float16)
+                            deltas = np.diff(np.concatenate((
+                                np.asarray([state["previous_index"]], dtype=np.int64),
+                                flat_indices,
+                            )))
+                            write_correction_records(
+                                export["stream"], deltas, residual_fp16
+                            )
+                            state["previous_index"] = int(flat_indices[-1])
 
-            if correction_map_stream is not None and tensor_correction_count:
-                correction_manifest.append({
-                    "tensor_id": len(correction_manifest),
-                    "tensor": target_name,
-                    "source_tensor": source_name,
-                    "shape": list(source_shape),
-                    "num_weights": int(math.prod(source_shape)),
-                    "encoding_offset_bytes": int(tensor_map_offset),
-                    "encoding_length_bytes": int(correction_map_stream.tell() - tensor_map_offset),
-                    "correction_count": int(tensor_correction_count),
-                    "max_error_after_fp16_residual": float(tensor_correction_max_error),
-                    "corrected_weights_still_nonzero_error": int(tensor_correction_nonzero_error),
-                })
+                            corrected_values = (
+                                reconstructed32[selected]
+                                + residual_fp16.astype(np.float32)
+                            )
+                            post_selected_errors = np.abs(
+                                original32[selected] - corrected_values
+                            )
+                            post_errors[selected] = post_selected_errors
+                            selected_count = int(selected.size)
+
+                            state["count"] += selected_count
+                            state["max_error"] = max(
+                                state["max_error"],
+                                float(post_selected_errors.max(initial=0.0)),
+                            )
+                            state["nonzero_error"] += int(
+                                np.count_nonzero(post_selected_errors)
+                            )
+                            export["correction_total"] += selected_count
+                            export["correction_fp16_error_max"] = max(
+                                export["correction_fp16_error_max"],
+                                float(post_selected_errors.max(initial=0.0)),
+                            )
+                            export["correction_fp16_error_nonzero"] += int(
+                                np.count_nonzero(post_selected_errors)
+                            )
+
+                        post64 = post_errors.astype(np.float64)
+                        export["global_abs_sum"] += float(
+                            np.sum(post_errors, dtype=np.float64)
+                        )
+                        export["global_sq_sum"] += float(np.dot(post64, post64))
+                        export["global_max"] = max(
+                            export["global_max"],
+                            float(post_errors.max(initial=0.0)),
+                        )
+                        export["global_count"] += int(original32.size)
+
+            for export in correction_exports:
+                state = tensor_export_states[export["tag"]]
+                if state["count"]:
+                    export["tensor_manifest"].append({
+                        "tensor_id": len(export["tensor_manifest"]),
+                        "tensor": target_name,
+                        "source_tensor": source_name,
+                        "shape": list(source_shape),
+                        "num_weights": int(math.prod(source_shape)),
+                        "encoding_offset_bytes": state["offset"],
+                        "encoding_length_bytes": int(
+                            export["stream"].tell() - state["offset"]
+                        ),
+                        "correction_count": int(state["count"]),
+                        "max_error_after_fp16_residual": float(state["max_error"]),
+                        "corrected_weights_still_nonzero_error": int(state["nonzero_error"]),
+                    })
 
             tensor_result = finish_metrics(tensor_metrics)
             tensor_rows.append({
@@ -552,38 +643,69 @@ def main() -> int:
             processed += 1
             del dequantized
 
-    if correction_map_stream is not None:
-        correction_map_bytes = correction_map_path.stat().st_size
+    correction_results: list[dict[str, Any]] = []
+    for export in correction_exports:
+        correction_map_bytes = export["map_path"].stat().st_size
+        quantized_count = int(export["global_count"])
+        correction_mae = (
+            export["global_abs_sum"] / quantized_count if quantized_count else None
+        )
+        correction_rmse = (
+            math.sqrt(export["global_sq_sum"] / quantized_count)
+            if quantized_count else None
+        )
         correction_manifest_payload = {
             "source_model": args.source_model,
             "quantized_model": args.quantized_model,
             "quantization": "bitsandbytes NF4, dequantized from the stored checkpoint QuantState",
-            "selection_rule": f"abs(source_weight - nf4_dequantized_weight) > {args.correction_threshold}",
+            "selection_rule": (
+                "abs(source_weight - nf4_dequantized_weight) > "
+                f"{export['threshold']}"
+            ),
             "application": "corrected_weight = NF4_dequantized_weight + FP16_residual",
             "record_encoding": "within each tensor: unsigned LEB128 delta-coded flat index + little-endian FP16 residual",
             "index_rule": "indices restart at each tensor; first delta is flat_index + 1",
-            "threshold": args.correction_threshold,
-            "correction_count": correction_total,
+            "threshold": export["threshold"],
+            "correction_count": export["correction_total"],
+            "map_file": str(export["map_path"]),
             "map_bytes": correction_map_bytes,
             "map_mib": correction_map_bytes / (1024 ** 2),
-            "max_error_on_corrected_weights_after_fp16": correction_fp16_error_max,
-            "corrected_weights_still_nonzero_error": correction_fp16_error_nonzero,
-            "max_error_among_quantized_weights_after_map": correction_global_max,
-            "mae_among_quantized_weights_after_map": (
-                correction_global_abs_sum / correction_global_count
-                if correction_global_count else None
-            ),
-            "rmse_among_quantized_weights_after_map": (
-                math.sqrt(correction_global_sq_sum / correction_global_count)
-                if correction_global_count else None
-            ),
-            "tensor_manifest": correction_manifest,
+            "max_error_on_corrected_weights_after_fp16": export["correction_fp16_error_max"],
+            "corrected_weights_still_nonzero_error": export["correction_fp16_error_nonzero"],
+            "max_error_among_quantized_weights_after_map": export["global_max"],
+            "mae_among_quantized_weights_after_map": correction_mae,
+            "rmse_among_quantized_weights_after_map": correction_rmse,
+            "tensor_manifest": export["tensor_manifest"],
             "caveat": "This exports residuals for a separate runtime to apply. The BNB checkpoint itself is not modified and will not consume this map automatically.",
         }
-        correction_manifest_path.write_text(
+        export["manifest_path"].write_text(
             json.dumps(correction_manifest_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        correction_results.append({
+            "threshold": export["threshold"],
+            "map_file": str(export["map_path"]),
+            "manifest_file": str(export["manifest_path"]),
+            "correction_count": export["correction_total"],
+            "map_bytes": correction_map_bytes,
+            "map_mib": correction_map_bytes / (1024 ** 2),
+            "max_error_on_corrected_weights_after_fp16": export["correction_fp16_error_max"],
+            "corrected_weights_still_nonzero_error": export["correction_fp16_error_nonzero"],
+            "max_error_among_quantized_weights_after_map": export["global_max"],
+            "mae_among_quantized_weights_after_map": correction_mae,
+            "rmse_among_quantized_weights_after_map": correction_rmse,
+        })
+
+    if not args.export_corrections:
+        correction_report: dict[str, Any] = {"enabled": False}
+    elif len(correction_results) == 1:
+        correction_report = {"enabled": True, **correction_results[0]}
+    else:
+        correction_report = {
+            "enabled": True,
+            "thresholds": [item["threshold"] for item in correction_results],
+            "maps": correction_results,
+        }
 
     tensor_rows.sort(key=lambda item: item["max_abs_error"], reverse=True)
     with tensor_csv.open("w", newline="", encoding="utf-8-sig") as stream:
@@ -636,27 +758,7 @@ def main() -> int:
         "all_matched_weights": finish_metrics(overall),
         "bnb_quantized_weights_only": finish_metrics(quantized_metrics),
         "unquantized_weights_only": finish_metrics(unquantized_metrics),
-        "correction_map": (
-            {
-                "enabled": True,
-                "threshold": args.correction_threshold,
-                "map_file": str(correction_map_path),
-                "manifest_file": str(correction_manifest_path),
-                "correction_count": correction_total,
-                "map_bytes": correction_map_bytes,
-                "max_error_on_corrected_weights_after_fp16": correction_fp16_error_max,
-                "corrected_weights_still_nonzero_error": correction_fp16_error_nonzero,
-                "max_error_among_quantized_weights_after_map": correction_global_max,
-                "mae_among_quantized_weights_after_map": (
-                    correction_global_abs_sum / correction_global_count
-                    if correction_global_count else None
-                ),
-                "rmse_among_quantized_weights_after_map": (
-                    math.sqrt(correction_global_sq_sum / correction_global_count)
-                    if correction_global_count else None
-                ),
-            } if args.export_corrections else {"enabled": False}
-        ),
+        "correction_map": correction_report,
         "tensor_csv": str(tensor_csv),
         "top_deviations_csv": str(top_csv),
         "limitations": [
@@ -689,11 +791,17 @@ def main() -> int:
     print(f"Por tensor: {tensor_csv}")
     print(f"Maiores desvios individuais: {top_csv}")
     if args.export_corrections:
-        print(f"Mapa esparso: {correction_map_path} ({correction_map_bytes:,} bytes)")
-        print(f"Manifesto do mapa: {correction_manifest_path}")
-        print(f"Correções exportadas: {correction_total:,}")
-        print(f"Erro máximo nas correções após FP16: {correction_fp16_error_max:.8g}")
-        print(f"Erro máximo global pós-mapa: {correction_global_max:.8g}")
+        for result in correction_results:
+            print(
+                f"Mapa esparso (limiar {result['threshold']:g}): "
+                f"{result['map_file']} ({result['map_bytes']:,} bytes)"
+            )
+            print(f"  Manifesto: {result['manifest_file']}")
+            print(f"  Correções: {result['correction_count']:,}")
+            print(
+                "  Erro máximo global pós-mapa: "
+                f"{result['max_error_among_quantized_weights_after_map']:.8g}"
+            )
     return 0
 
 
