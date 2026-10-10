@@ -83,6 +83,7 @@ WEIGHT_FIELDS = [
     "block_index", "position_in_block", "bf16_original", "q4_reconstructed",
     "delta_q4_minus_bf16", "absolute_error", "relative_error_percent",
     "q4_scale_step", "error_in_q4_steps",
+    "block_start_flat_index", "block_start_coordinates",
 ]
 
 
