@@ -475,7 +475,7 @@ def main() -> int:
     reference_comparison = None
 
     if args.reference_model:
-        print("\\nLiberando o NF4 antes de carregar a referência BF16 ...", flush=True)
+        print("\nLiberando o NF4 antes de carregar a referência BF16 ...", flush=True)
         reference_inputs_cpu = {key: value.detach().cpu() for key, value in inputs.items()}
         for handle in handles:
             handle.remove()
@@ -556,7 +556,7 @@ def main() -> int:
                 "reduziu o RMSE dos logits em relação à referência; negativo significa piora."
             ),
         }
-        print("\\n=== COMPARAÇÃO CONTRA A REFERÊNCIA ===", flush=True)
+        print("\n=== COMPARAÇÃO CONTRA A REFERÊNCIA ===", flush=True)
         print(json.dumps(reference_comparison, ensure_ascii=False, indent=2), flush=True)
         del reference_inputs, reference_inputs_cpu, reference_logits, reference_model
         gc.collect()
