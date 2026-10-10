@@ -101,8 +101,8 @@ def fit_rowwise_codebooks(
                 weights=ordered.reshape(-1).astype(np.float64, copy=False),
                 minlength=batch_rows * group_count,
             ).reshape(batch_rows, group_count)
-            new_centers = centers.copy()
-            np.divide(sums, counts, out=new_centers, where=counts > 0)
+            means = sums / np.maximum(counts, 1)
+            new_centers = np.where(counts > 0, means, centers).astype(np.float32)
             change = float(np.max(np.abs(new_centers - centers)))
             centers = new_centers
             if change <= 1e-7:
