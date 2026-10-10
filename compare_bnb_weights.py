@@ -12,6 +12,7 @@ import csv
 import heapq
 import json
 import math
+import struct
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,19 @@ def parse_thresholds(value: str) -> list[float]:
     if len(set(values)) != len(values):
         raise argparse.ArgumentTypeError("Os limites não podem se repetir.")
     return sorted(values, reverse=True)
+
+
+def write_uvarint(stream: Any, value: int) -> int:
+    """Write an unsigned LEB128 integer and return its encoded length."""
+    if value < 0:
+        raise ValueError("varint must be non-negative")
+    count = 0
+    while value >= 0x80:
+        stream.write(bytes([(value & 0x7F) | 0x80]))
+        value >>= 7
+        count += 1
+    stream.write(bytes([value]))
+    return count + 1
 
 
 def index_tensors(files: list[Path]) -> dict[str, dict[str, Any]]:
@@ -304,6 +318,10 @@ def main() -> int:
     parser.add_argument("--thresholds", type=parse_thresholds,
                         default=list(DEFAULT_THRESHOLDS),
                         help="Limites de erro absoluto para contar desvios; separados por vírgula.")
+    parser.add_argument("--export-corrections", action="store_true",
+                        help="Exportar mapa esparso com os resíduos dos pesos NF4 cujo erro excede --correction-threshold.")
+    parser.add_argument("--correction-threshold", type=float, default=0.01,
+                        help="Limite absoluto para exportar correções (padrão: 0.01).")
     parser.add_argument("--output-dir", default="bnb_weight_validation")
     args = parser.parse_args()
 
@@ -311,6 +329,8 @@ def main() -> int:
         parser.error("--chunk-elements precisa ser positivo")
     if args.top_k < 0:
         parser.error("--top-k não pode ser negativo")
+    if not math.isfinite(args.correction_threshold) or args.correction_threshold < 0:
+        parser.error("--correction-threshold precisa ser finito e não negativo")
     if bnb_F is None:
         parser.error("bitsandbytes não está instalado. Instale com: pip install bitsandbytes")
 
@@ -348,6 +368,8 @@ def main() -> int:
     tensor_csv = output / "tensor_comparison.csv"
     top_csv = output / "top_weight_deviations.csv"
     report_path = output / "report.json"
+    correction_map_path = output / f"correction_map_gt_{str(args.correction_threshold).replace('.', 'p')}.bin"
+    correction_manifest_path = output / "correction_map_manifest.json"
 
     if not matched:
         raise RuntimeError(
@@ -364,10 +386,22 @@ def main() -> int:
     unquantized_tensor_count = 0
     shape_mismatches: list[dict[str, Any]] = []
     processed = 0
+    correction_manifest: list[dict[str, Any]] = []
+    correction_total = 0
+    correction_fp16_error_max = 0.0
+    correction_fp16_error_nonzero = 0
+    correction_map_stream = None
+    correction_map_bytes = 0
+    correction_global_abs_sum = 0.0
+    correction_global_sq_sum = 0.0
+    correction_global_max = 0.0
+    correction_global_count = 0
 
     with ExitStack() as stack:
         source_handles = open_safetensors(source_files, stack)
         target_handles = open_safetensors(target_files, stack)
+        if args.export_corrections:
+            correction_map_stream = stack.enter_context(correction_map_path.open("wb"))
 
         for number, (target_name, source_name) in enumerate(matched, 1):
             target_item = target_index[target_name]
@@ -393,6 +427,11 @@ def main() -> int:
             tensor_metrics = new_metrics(args.thresholds)
             source_dtype = "unknown"
             target_dtype = "unknown"
+            tensor_map_offset = correction_map_stream.tell() if correction_map_stream else 0
+            tensor_correction_count = 0
+            tensor_correction_max_error = 0.0
+            tensor_correction_nonzero_error = 0
+            previous_correction_index = -1
 
             dequantized = None
             if quantized:
@@ -443,6 +482,64 @@ def main() -> int:
                     flat_start, original, reconstructed,
                 )
 
+                if correction_map_stream is not None and quantized:
+                    # Residual is original minus the actually dequantized NF4 value.
+                    original32 = np.asarray(original, dtype=np.float32).reshape(-1)
+                    reconstructed32 = np.asarray(reconstructed, dtype=np.float32).reshape(-1)
+                    signed_residual = original32 - reconstructed32
+                    selected = np.flatnonzero(np.abs(signed_residual) > args.correction_threshold)
+                    corrected_abs_errors = np.abs(reconstructed32 - original32)
+                    if selected.size:
+                        for local_raw in selected:
+                            local = int(local_raw)
+                            flat_index = flat_start + local
+                            residual_fp16 = np.float16(signed_residual[local])
+                            index_delta = flat_index - previous_correction_index
+                            write_uvarint(correction_map_stream, index_delta)
+                            correction_map_stream.write(struct.pack("<e", float(residual_fp16)))
+                            previous_correction_index = flat_index
+                            tensor_correction_count += 1
+                            correction_total += 1
+
+                            post_error = abs(
+                                float(original32[local])
+                                - (float(reconstructed32[local]) + float(residual_fp16))
+                            )
+                            tensor_correction_max_error = max(
+                                tensor_correction_max_error, post_error
+                            )
+                            correction_fp16_error_max = max(
+                                correction_fp16_error_max, post_error
+                            )
+                            if post_error != 0.0:
+                                tensor_correction_nonzero_error += 1
+                                correction_fp16_error_nonzero += 1
+                            corrected_abs_errors[local] = post_error
+
+                    correction_global_abs_sum += float(np.sum(corrected_abs_errors, dtype=np.float64))
+                    correction_global_sq_sum += float(
+                        np.sum(corrected_abs_errors.astype(np.float64) ** 2, dtype=np.float64)
+                    )
+                    correction_global_max = max(
+                        correction_global_max,
+                        float(corrected_abs_errors.max(initial=0.0)),
+                    )
+                    correction_global_count += int(original32.size)
+
+            if correction_map_stream is not None and tensor_correction_count:
+                correction_manifest.append({
+                    "tensor_id": len(correction_manifest),
+                    "tensor": target_name,
+                    "source_tensor": source_name,
+                    "shape": list(source_shape),
+                    "num_weights": int(math.prod(source_shape)),
+                    "encoding_offset_bytes": int(tensor_map_offset),
+                    "encoding_length_bytes": int(correction_map_stream.tell() - tensor_map_offset),
+                    "correction_count": int(tensor_correction_count),
+                    "max_error_after_fp16_residual": float(tensor_correction_max_error),
+                    "corrected_weights_still_nonzero_error": int(tensor_correction_nonzero_error),
+                })
+
             tensor_result = finish_metrics(tensor_metrics)
             tensor_rows.append({
                 "source_tensor": source_name,
@@ -454,6 +551,39 @@ def main() -> int:
             })
             processed += 1
             del dequantized
+
+    if correction_map_stream is not None:
+        correction_map_bytes = correction_map_path.stat().st_size
+        correction_manifest_payload = {
+            "source_model": args.source_model,
+            "quantized_model": args.quantized_model,
+            "quantization": "bitsandbytes NF4, dequantized from the stored checkpoint QuantState",
+            "selection_rule": f"abs(source_weight - nf4_dequantized_weight) > {args.correction_threshold}",
+            "application": "corrected_weight = NF4_dequantized_weight + FP16_residual",
+            "record_encoding": "within each tensor: unsigned LEB128 delta-coded flat index + little-endian FP16 residual",
+            "index_rule": "indices restart at each tensor; first delta is flat_index + 1",
+            "threshold": args.correction_threshold,
+            "correction_count": correction_total,
+            "map_bytes": correction_map_bytes,
+            "map_mib": correction_map_bytes / (1024 ** 2),
+            "max_error_on_corrected_weights_after_fp16": correction_fp16_error_max,
+            "corrected_weights_still_nonzero_error": correction_fp16_error_nonzero,
+            "max_error_among_quantized_weights_after_map": correction_global_max,
+            "mae_among_quantized_weights_after_map": (
+                correction_global_abs_sum / correction_global_count
+                if correction_global_count else None
+            ),
+            "rmse_among_quantized_weights_after_map": (
+                math.sqrt(correction_global_sq_sum / correction_global_count)
+                if correction_global_count else None
+            ),
+            "tensor_manifest": correction_manifest,
+            "caveat": "This exports residuals for a separate runtime to apply. The BNB checkpoint itself is not modified and will not consume this map automatically.",
+        }
+        correction_manifest_path.write_text(
+            json.dumps(correction_manifest_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     tensor_rows.sort(key=lambda item: item["max_abs_error"], reverse=True)
     with tensor_csv.open("w", newline="", encoding="utf-8-sig") as stream:
@@ -506,6 +636,27 @@ def main() -> int:
         "all_matched_weights": finish_metrics(overall),
         "bnb_quantized_weights_only": finish_metrics(quantized_metrics),
         "unquantized_weights_only": finish_metrics(unquantized_metrics),
+        "correction_map": (
+            {
+                "enabled": True,
+                "threshold": args.correction_threshold,
+                "map_file": str(correction_map_path),
+                "manifest_file": str(correction_manifest_path),
+                "correction_count": correction_total,
+                "map_bytes": correction_map_bytes,
+                "max_error_on_corrected_weights_after_fp16": correction_fp16_error_max,
+                "corrected_weights_still_nonzero_error": correction_fp16_error_nonzero,
+                "max_error_among_quantized_weights_after_map": correction_global_max,
+                "mae_among_quantized_weights_after_map": (
+                    correction_global_abs_sum / correction_global_count
+                    if correction_global_count else None
+                ),
+                "rmse_among_quantized_weights_after_map": (
+                    math.sqrt(correction_global_sq_sum / correction_global_count)
+                    if correction_global_count else None
+                ),
+            } if args.export_corrections else {"enabled": False}
+        ),
         "tensor_csv": str(tensor_csv),
         "top_deviations_csv": str(top_csv),
         "limitations": [
@@ -537,6 +688,12 @@ def main() -> int:
     print(f"Relatório: {report_path}")
     print(f"Por tensor: {tensor_csv}")
     print(f"Maiores desvios individuais: {top_csv}")
+    if args.export_corrections:
+        print(f"Mapa esparso: {correction_map_path} ({correction_map_bytes:,} bytes)")
+        print(f"Manifesto do mapa: {correction_manifest_path}")
+        print(f"Correções exportadas: {correction_total:,}")
+        print(f"Erro máximo nas correções após FP16: {correction_fp16_error_max:.8g}")
+        print(f"Erro máximo global pós-mapa: {correction_global_max:.8g}")
     return 0
 
 
