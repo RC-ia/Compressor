@@ -542,6 +542,7 @@ Execute usando os arquivos criados pelo comando `compare_bnb_weights.py --export
   --prompt "Explique brevemente por que o céu parece azul." `
   --max-new-tokens 48 `
   --device-map auto `
+  --compute-dtype float16 `
   --output ".\bnb_weight_validation\correction_runtime_test.json"
 ```
 
