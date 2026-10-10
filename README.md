@@ -476,3 +476,36 @@ O relatório `representatives_vs_q4_report.json` registra tamanho do mapa e das 
 Na matriz padrão de 9.216 linhas, com 16 representantes FP16 por linha, o codebook ocupa 294.912 bytes (cerca de 0,295 MB) além do mapa de 4 bits por peso. O programa calcula o custo real a partir das dimensões da matriz, em vez de assumir esse tamanho para todas as matrizes.
 
 **Escopo:** o experimento compara erro numérico dos pesos, não perplexidade, qualidade de geração ou velocidade de inferência. Q4_0 é uma base Q4 simples em blocos; não deve ser confundido com Q4_K_M. O payload contabilizado não inclui cabeçalhos de um contêiner como NPZ.
+
+
+## Comparação real: BF16 original vs. checkpoint bitsandbytes NF4
+
+\`compare_bnb_weights.py\` compara o checkpoint BNB NF4 já salvo com seus pesos BF16 de origem. Diferentemente dos experimentos Q4_0 anteriores, o script **não simula uma nova quantização**: lê os códigos NF4 e seu \`QuantState\` diretamente dos Safetensors, desquantiza um tensor por vez e compara os valores reconstruídos com a origem.
+
+O destino padrão é \`techwithsergiu/Qwen3.5-text-4B-bnb-4bit\`, cuja origem direta é \`techwithsergiu/Qwen3.5-text-4B\`. Se você já tem o Qwen multimodal original em \`.\Qwen3.5-4B\`, pode usá-lo como fonte: o script tenta mapear automaticamente \`model.layers.*\` do modelo somente de texto para \`model.language_model.layers.*\` da origem multimodal. Os tensores visuais removidos aparecem como tensores presentes apenas na origem e não entram na comparação.
+
+Instale bitsandbytes no ambiente que já contém PyTorch:
+
+\`\`\`powershell
+.\\.venv-smoke\\Scripts\\python.exe -m pip install bitsandbytes
+\`\`\`
+
+Execute a comparação no modelo original local e no NF4 publicado:
+
+\`\`\`powershell
+.\\.venv-smoke\\Scripts\\python.exe compare_bnb_weights.py \`
+  --source-model ".\\Qwen3.5-4B" \`
+  --quantized-model "techwithsergiu/Qwen3.5-text-4B-bnb-4bit" \`
+  --device cuda \`
+  --thresholds 1,0.5,0.1,0.05,0.01 \`
+  --output-dir bnb_weight_validation
+\`\`\`
+
+O primeiro uso baixa o checkpoint NF4 de aproximadamente 3,12 GB se ele ainda não estiver no cache. Para usar os arquivos BF16 text-only exatos que deram origem à quantização, troque \`--source-model\` por \`techwithsergiu/Qwen3.5-text-4B\`; isso pode exigir baixar vários GB adicionais. Também é possível apontar \`--quantized-model\` a um diretório local já baixado.
+
+Saídas:
+- \`report.json\`: erro global de todos os tensores pareados e métricas separadas para pesos NF4 e tensores que permaneceram em maior precisão.
+- \`tensor_comparison.csv\`: MAE, RMSE, erro máximo, similaridade cosseno e contagem acima de cada limite para cada tensor.
+- \`top_weight_deviations.csv\`: os maiores desvios individuais, com tensor, índice, coordenadas, peso de origem, peso NF4 reconstruído e delta.
+
+**Importante:** o script usa a desquantização do bitsandbytes sobre os dados realmente armazenados; não quantiza de novo os pesos de origem. Ele mede diferenças numéricas dos pesos, não perplexidade nem qualidade de geração. Se a desquantização NF4 falhar no backend CUDA instalado, o script interrompe com o nome do tensor em vez de substituir silenciosamente o resultado por uma simulação.
