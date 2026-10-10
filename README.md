@@ -594,3 +594,33 @@ git pull
 A referência deve ser o checkpoint BF16/textual correspondente à base usada pelo modelo NF4, não um modelo apenas parecido. `--reference-dtype auto` respeita o dtype declarado pelo checkpoint; confirme no relatório o campo `reference_embedding_dtype`. O script libera o modelo NF4 antes de carregar a referência e limita a RAM usada pelo modelo de referência. Camadas excedentes podem ser transferidas para `bf16_offload\` no disco, exigindo espaço livre adicional e tornando a avaliação significativamente mais lenta. O mapa temporário não modifica nenhum checkpoint.
 
 O relatório calcula, para os logits do último token de entrada, RMSE, MAE, diferença máxima, similaridade cosseno e coincidência do token mais provável de cada versão em relação à referência. **`correction_rmse_improvement_percent` positivo significa que os logits corrigidos ficaram mais próximos pelo RMSE; negativo significa que ficaram mais distantes.** Um único prompt é apenas um teste inicial; repita a comparação com vários prompts para verificar se o efeito é consistente.
+
+
+### Comparar NF4, vários mapas e BF16 em uma única execução
+
+O script aceita repetir `--map-file` e `--manifest`. Cada mapa é carregado, aplicado e liberado separadamente; os logits NF4 de base são calculados uma única vez. Ao fornecer `--reference-model`, o relatório compara NF4 e cada variante corrigida contra a mesma referência BF16.
+
+Exemplo com os mapas 0,005 e 0,004 já exportados:
+
+```powershell
+git pull
+
+.\.venv-smoke\Scripts\python.exe apply_bnb_corrections.py `
+  --model "techwithsergiu/Qwen3.5-text-4B-bnb-4bit" `
+  --map-file ".\bnb_weight_validation\correction_map_gt_0p005.bin" `
+  --manifest ".\bnb_weight_validation\correction_map_gt_0p005_manifest.json" `
+  --map-file ".\bnb_weight_validation\correction_map_gt_0p004.bin" `
+  --manifest ".\bnb_weight_validation\correction_map_gt_0p004_manifest.json" `
+  --prompt "Explique brevemente por que o céu parece azul." `
+  --max-new-tokens 48 `
+  --device-map gpu `
+  --compute-dtype float16 `
+  --reference-model "techwithsergiu/Qwen3.5-text-4B" `
+  --reference-dtype auto `
+  --reference-max-cpu-memory "4GiB" `
+  --output ".\bnb_weight_validation\correction_vs_bf16_005_004.json"
+```
+
+A referência fica no dtype nativo do checkpoint (`torch.bfloat16` quando confirmado no relatório), usando CPU/disco conforme o limite de memória. O arquivo JSON contém a diferença NF4 versus cada mapa e a distância de todas as versões ao BF16. Os textos gerados são incluídos para conferência, embora a principal comparação numérica seja feita diretamente nos logits do último token de entrada.
+
+A leitura do mapa foi alterada para usar buffers compactos durante a decodificação, e apenas um mapa é mantido em memória/VRAM de cada vez. Mesmo assim, o mapa 0,004 adiciona 14,3 milhões de resíduos e pode consumir centenas de MB de VRAM ao executar os hooks; se a CUDA ficar sem memória, tente diminuir o limiar de correções para 0,005 ou libere outros processos da GPU.
