@@ -519,5 +519,8 @@ Saídas:
 - `report.json`: erro global de todos os tensores pareados e métricas separadas para pesos NF4 e tensores que permaneceram em maior precisão.
 - `tensor_comparison.csv`: MAE, RMSE, erro máximo, similaridade cosseno e contagem acima de cada limite para cada tensor.
 - `top_weight_deviations.csv`: os maiores desvios individuais, com tensor, índice, coordenadas, peso de origem, peso NF4 reconstruído e delta.
+- Quando `--export-corrections` é usado, `correction_map_gt_0p01.bin` guarda índices delta-coded locais a cada tensor e resíduos FP16; `correction_map_manifest.json` indica offsets, dimensões e contagens para decodificar cada seção.
+
+O mapa auxiliar é apenas exportado: ele **não modifica o checkpoint nem é aplicado automaticamente pelo Transformers**. A aplicação durante a inferência ainda exige um módulo que interprete o manifesto, decodifique as entradas e some a contribuição dos resíduos nas camadas correspondentes.
 
 **Importante:** o script usa a desquantização do bitsandbytes sobre os dados realmente armazenados; não quantiza de novo os pesos de origem. Ele mede diferenças numéricas dos pesos, não perplexidade nem qualidade de geração. Se a desquantização NF4 falhar no backend CUDA instalado, o script interrompe com o nome do tensor em vez de substituir silenciosamente o resultado por uma simulação.
