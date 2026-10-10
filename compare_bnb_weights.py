@@ -399,12 +399,12 @@ def main() -> int:
                 dequantized = dequantize_bnb_tensor(
                     target_handle, target_name, state_keys_by_weight[target_name], device
                 )
-                if dequantized.numel() != math.prod(source_shape):
+                if tuple(int(v) for v in dequantized.shape) != source_shape:
                     raise RuntimeError(
-                        f"{target_name}: desquantização retornou {dequantized.numel()} valores, "
-                        f"mas a origem tem {math.prod(source_shape)} ({source_shape})."
+                        f"{target_name}: forma reconstruída {tuple(dequantized.shape)} "
+                        f"difere da origem {source_shape}; não será comparada por reshape."
                     )
-                dequantized = dequantized.reshape(source_shape).contiguous()
+                dequantized = dequantized.contiguous()
                 target_dtype = str(target_item["shape"]) + " / BNB NF4"
                 quantized_tensor_count += 1
             else:
