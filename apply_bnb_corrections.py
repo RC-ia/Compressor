@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Apply a sparse NF4 correction sidecar during Transformers inference.
+
+The original BNB checkpoint remains untouched. Forward hooks add E*x to each
+matched Linear4bit output, where E contains only the FP16 residual entries
+exported by compare_bnb_weights.py.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import struct
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch import nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    from bitsandbytes.nn import Linear4bit
+except Exception:
+    Linear4bit = None
+
+
+def read_uvarint(data: bytes, position: int, end: int) -> tuple[int, int]:
+    """Read unsigned LEB128 and return (value, updated_position)."""
+    value = 0
+    shift = 0
+    while position < end:
+        byte = data[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, position
+        shift += 7
+        if shift > 63:
+            raise ValueError("Índice LEB128 excedeu 64 bits.")
+    raise ValueError("Mapa truncado durante leitura do índice LEB128.")
+
+
+def load_map(
+    map_path: Path, manifest_path: Path
+) -> list[dict[str, Any]]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data = map_path.read_bytes()
+    expected_bytes = payload.get("map_bytes")
+    if expected_bytes is not None and int(expected_bytes) != len(data):
+        raise ValueError(
+            f"Tamanho do mapa divergente: manifesto={expected_bytes}, arquivo={len(data)}."
+        )
+
+    records: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for entry in payload.get("tensor_manifest", []):
+        tensor_name = entry["tensor"]
+        if tensor_name in seen_names:
+            raise ValueError(f"Tensor duplicado no manifesto: {tensor_name}")
+        seen_names.add(tensor_name)
+
+        shape = tuple(int(v) for v in entry["shape"])
+        if len(shape) != 2:
+            raise ValueError(
+                f"{tensor_name}: esperado tensor Linear 2D, recebido shape={shape}."
+            )
+        num_weights = math.prod(shape)
+        if num_weights != int(entry["num_weights"]):
+            raise ValueError(f"{tensor_name}: num_weights não coincide com shape.")
+
+        start = int(entry["encoding_offset_bytes"])
+        length = int(entry["encoding_length_bytes"])
+        count = int(entry["correction_count"])
+        end = start + length
+        if start < 0 or length < 0 or end > len(data):
+            raise ValueError(f"{tensor_name}: offsets do mapa fora do arquivo.")
+
+        position = start
+        previous_index = -1
+        indices: list[int] = []
+        residuals: list[float] = []
+        for _ in range(count):
+            delta, position = read_uvarint(data, position, end)
+            if delta <= 0:
+                raise ValueError(f"{tensor_name}: delta de índice inválido.")
+            flat_index = previous_index + delta
+            if flat_index < 0 or flat_index >= num_weights:
+                raise ValueError(
+                    f"{tensor_name}: índice {flat_index} fora do tensor ({num_weights})."
+                )
+            if position + 2 > end:
+                raise ValueError(f"{tensor_name}: falta resíduo FP16 no mapa.")
+            residual = struct.unpack_from("<e", data, position)[0]
+            position += 2
+            indices.append(flat_index)
+            residuals.append(float(residual))
+            previous_index = flat_index
+
+        if position != end:
+            raise ValueError(
+                f"{tensor_name}: {end - position} bytes sobrando na seção do tensor."
+            )
+
+        index_tensor = torch.tensor(indices, dtype=torch.long)
+        residual_tensor = torch.tensor(residuals, dtype=torch.float32)
+        out_features, in_features = shape
+        records.append({
+            "tensor": tensor_name,
+            "module": tensor_name[:-7] if tensor_name.endswith(".weight") else tensor_name,
+            "shape": shape,
+            "out_features": out_features,
+            "in_features": in_features,
+            "rows": torch.div(index_tensor, in_features, rounding_mode="floor"),
+            "cols": torch.remainder(index_tensor, in_features),
+            "values": residual_tensor,
+            "count": count,
+        })
+
+    if not records:
+        raise ValueError("O manifesto não contém tensores com correções.")
+    return records
+
+
+def _device_cache(record: dict[str, Any], device: torch.device):
+    key = str(device)
+    cache = record.setdefault("_device_cache", {})
+    if key not in cache:
+        cache[key] = (
+            record["rows"].to(device=device, non_blocking=True),
+            record["cols"].to(device=device, non_blocking=True),
+            record["values"].to(device=device, dtype=torch.float32, non_blocking=True),
+        )
+    return cache[key]
+
+
+def install_hooks(model: nn.Module, records: list[dict[str, Any]], state: dict[str, bool],
+                  max_temp_elements: int = 1_000_000) -> tuple[list[Any], dict[str, int]]:
+    modules = dict(model.named_modules())
+    handles = []
+    stats = {"installed": 0, "missing": 0, "shape_mismatch": 0, "not_4bit_linear": 0}
+    missing_names = []
+
+    for record in records:
+        module_name = record["module"]
+        module = modules.get(module_name)
+        if module is None:
+            stats["missing"] += 1
+            missing_names.append(module_name)
+            continue
+        if Linear4bit is not None and not isinstance(module, Linear4bit):
+            stats["not_4bit_linear"] += 1
+            continue
+        if not hasattr(module, "in_features") or not hasattr(module, "out_features"):
+            stats["not_4bit_linear"] += 1
+            continue
+        if (
+            int(module.out_features) != record["out_features"]
+            or int(module.in_features) != record["in_features"]
+        ):
+            stats["shape_mismatch"] += 1
+            continue
+
+        def make_hook(rec: dict[str, Any]):
+            def hook(_module: nn.Module, inputs: tuple[Any, ...], output: Any):
+                if not state["enabled"]:
+                    return output
+                if not isinstance(output, torch.Tensor) or not inputs:
+                    raise TypeError(f"{rec['module']}: saída/entrada inesperada no forward hook.")
+                x = inputs[0]
+                if not isinstance(x, torch.Tensor) or x.shape[-1] != rec["in_features"]:
+                    raise ValueError(f"{rec['module']}: dimensão da entrada incompatível.")
+
+                rows, cols, values = _device_cache(rec, x.device)
+                flat_x = x.reshape(-1, rec["in_features"])
+                result = output.contiguous()
+                flat_out = result.view(-1, rec["out_features"])
+                nnz = int(values.numel())
+                tokens_per_chunk = max(1, max_temp_elements // max(1, nnz))
+
+                # Process token chunks to bound the temporary [tokens, nnz] buffer.
+                for begin in range(0, flat_x.shape[0], tokens_per_chunk):
+                    finish = min(flat_x.shape[0], begin + tokens_per_chunk)
+                    x_chunk = flat_x[begin:finish]
+                    contributions = x_chunk.index_select(1, cols).float()
+                    contributions.mul_(values.unsqueeze(0))
+                    correction = torch.zeros(
+                        (finish - begin, rec["out_features"]),
+                        device=x.device,
+                        dtype=torch.float32,
+                    )
+                    row_index = rows.unsqueeze(0).expand(finish - begin, -1)
+                    correction.scatter_add_(1, row_index, contributions)
+                    flat_out[begin:finish].add_(correction.to(dtype=flat_out.dtype))
+                return result
+            return hook
+
+        handles.append(module.register_forward_hook(make_hook(record)))
+        stats["installed"] += 1
+
+    if stats["missing"] or stats["shape_mismatch"] or stats["not_4bit_linear"]:
+        details = {
+            "stats": stats,
+            "missing_examples": missing_names[:20],
+        }
+        for handle in handles:
+            handle.remove()
+        raise RuntimeError(
+            "Nem todas as correções foram associadas a camadas Linear4bit compatíveis. "
+            + json.dumps(details, ensure_ascii=False)
+        )
+    return handles, stats
+
+
+def prompt_inputs(tokenizer: Any, prompt: str) -> dict[str, torch.Tensor]:
+    if getattr(tokenizer, "chat_template", None):
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        text = prompt
+    return tokenizer(text, return_tensors="pt")
+
+
+def choose_input_device(model: nn.Module) -> torch.device:
+    embeddings = model.get_input_embeddings()
+    if embeddings is not None:
+        device = embeddings.weight.device
+        if device.type != "meta":
+            return device
+
+    device_map = getattr(model, "hf_device_map", {})
+    named = dict(model.named_modules())
+    embed_name = None
+    if embeddings is not None:
+        embed_name = next((name for name, module in named.items() if module is embeddings), None)
+    if embed_name is not None:
+        candidates = [
+            (name, value) for name, value in device_map.items()
+            if embed_name == name or embed_name.startswith(name + ".")
+        ]
+        if candidates:
+            value = max(candidates, key=lambda item: len(item[0]))[1]
+            if isinstance(value, int):
+                return torch.device(f"cuda:{value}")
+            if isinstance(value, str) and value not in ("disk", "meta"):
+                return torch.device(value)
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def compare_logits(model: nn.Module, inputs: dict[str, torch.Tensor],
+                   state: dict[str, bool]) -> dict[str, Any]:
+    state["enabled"] = False
+    with torch.inference_mode():
+        baseline = model(**inputs, use_cache=False).logits[:, -1, :].float().cpu()
+    state["enabled"] = True
+    with torch.inference_mode():
+        corrected = model(**inputs, use_cache=False).logits[:, -1, :].float().cpu()
+
+    diff = corrected - baseline
+    a = baseline.reshape(-1).double()
+    b = corrected.reshape(-1).double()
+    dot = float(torch.dot(a, b))
+    norm = float(torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b))
+    return {
+        "max_abs_logit_difference": float(diff.abs().max()),
+        "rmse_logit_difference": float(torch.mean(diff.double() ** 2).sqrt()),
+        "argmax_changed": int(baseline.argmax(dim=-1).item() != corrected.argmax(dim=-1).item()),
+        "baseline_top_token_id": int(baseline.argmax(dim=-1).item()),
+        "corrected_top_token_id": int(corrected.argmax(dim=-1).item()),
+        "logit_cosine_similarity": dot / norm if norm else None,
+    }
+
+
+def generate_once(model: nn.Module, tokenizer: Any, inputs: dict[str, torch.Tensor],
+                  state: dict[str, bool], enabled: bool, max_new_tokens: int) -> tuple[str, float]:
+    state["enabled"] = enabled
+    start = time.perf_counter()
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    generated_ids = output[0, inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(generated_ids, skip_special_tokens=True), elapsed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="techwithsergiu/Qwen3.5-text-4B-bnb-4bit")
+    parser.add_argument("--map-file", required=True, help="correction_map_gt_*.bin gerado pelo comparador.")
+    parser.add_argument("--manifest", required=True, help="correction_map_manifest.json correspondente.")
+    parser.add_argument("--prompt", default="Explique brevemente por que o céu parece azul.")
+    parser.add_argument("--max-new-tokens", type=int, default=48)
+    parser.add_argument("--device-map", default="auto", help="Valor passado ao from_pretrained; padrão auto.")
+    parser.add_argument("--max-temp-elements", type=int, default=1_000_000,
+                        help="Limite aproximado para o buffer temporário tokens x correções.")
+    parser.add_argument("--output", default="bnb_correction_runtime_test.json")
+    args = parser.parse_args()
+
+    if Linear4bit is None:
+        parser.error("bitsandbytes não está instalado ou Linear4bit não pôde ser importado.")
+    if args.max_new_tokens < 1 or args.max_temp_elements < 1:
+        parser.error("--max-new-tokens e --max-temp-elements precisam ser positivos.")
+
+    map_path = Path(args.map_file).expanduser().resolve()
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    if not map_path.is_file() or not manifest_path.is_file():
+        parser.error("Não encontrei o mapa ou o manifesto informado.")
+
+    records = load_map(map_path, manifest_path)
+    print(f"Mapa: {map_path} ({map_path.stat().st_size:,} bytes)", flush=True)
+    print(f"Tensores no manifesto: {len(records)} | correções: {sum(r['count'] for r in records):,}", flush=True)
+
+    print(f"Carregando modelo {args.model} ...", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        device_map=args.device_map,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    state = {"enabled": False}
+    handles, hook_stats = install_hooks(
+        model, records, state, max_temp_elements=args.max_temp_elements
+    )
+    print(f"Hooks instalados: {hook_stats['installed']}", flush=True)
+
+    inputs = prompt_inputs(tokenizer, args.prompt)
+    input_device = choose_input_device(model)
+    inputs = {key: value.to(input_device) for key, value in inputs.items()}
+
+    print("Comparando logits antes/depois ...", flush=True)
+    logit_metrics = compare_logits(model, inputs, state)
+    print(json.dumps(logit_metrics, ensure_ascii=False, indent=2), flush=True)
+
+    baseline_text, baseline_seconds = generate_once(
+        model, tokenizer, inputs, state, False, args.max_new_tokens
+    )
+    corrected_text, corrected_seconds = generate_once(
+        model, tokenizer, inputs, state, True, args.max_new_tokens
+    )
+
+    report = {
+        "model": args.model,
+        "map_file": str(map_path),
+        "manifest_file": str(manifest_path),
+        "map_bytes": map_path.stat().st_size,
+        "correction_threshold": json.loads(manifest_path.read_text(encoding="utf-8")).get("threshold"),
+        "tensor_count": len(records),
+        "correction_count": sum(record["count"] for record in records),
+        "hook_stats": hook_stats,
+        "prompt": args.prompt,
+        "max_new_tokens": args.max_new_tokens,
+        "logit_comparison": logit_metrics,
+        "baseline_generation": baseline_text,
+        "corrected_generation": corrected_text,
+        "baseline_generation_seconds": baseline_seconds,
+        "corrected_generation_seconds": corrected_seconds,
+        "generation_seconds_ratio_corrected_over_baseline": (
+            corrected_seconds / baseline_seconds if baseline_seconds else None
+        ),
+        "note": "Prototype only. It applies sparse residuals through PyTorch forward hooks; it does not rewrite the checkpoint.",
+    }
+    output_path = Path(args.output).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    for handle in handles:
+        handle.remove()
+
+    print("\n=== RESULTADO DA CORREÇÃO ===")
+    print(f"Base:      {baseline_text}")
+    print(f"Corrigido: {corrected_text}")
+    print(f"Tempo base: {baseline_seconds:.2f}s | corrigido: {corrected_seconds:.2f}s")
+    print(f"Relatório: {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
