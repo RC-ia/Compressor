@@ -15,7 +15,7 @@ from safetensors import safe_open
 import compress_tensor as base
 
 BLOCK = 32
-DEFAULT_THRESHOLDS = (1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)
+DEFAULT_THRESHOLDS = (1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.08, 0.05, 0.03, 0.01)
 
 
 def q4_0_reconstruct_blocks(source: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -62,7 +62,7 @@ def main() -> int:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--thresholds", type=parse_thresholds,
                         default=list(DEFAULT_THRESHOLDS),
-                        help="Absolute-error thresholds, comma-separated (default: 1.0,0.8,0.6,0.5,0.4,0.3,0.2,0.1)")
+                        help="Absolute-error thresholds, comma-separated (default: 1.0,0.8,0.6,0.5,0.4,0.3,0.2,0.1,0.08,0.05,0.03,0.01)")
     parser.add_argument("--chunk-elements", type=int, default=1_048_576)
     parser.add_argument("--output-dir", default="q4_correction_map_results")
     args = parser.parse_args()
@@ -85,6 +85,9 @@ def main() -> int:
             "residual_bytes": 0, "max_error_before": 0.0,
             "max_error_after_fp16_residual": 0.0,
             "corrected_weights_still_nonzero_error": 0,
+            "eligible_weight_count": 0, "sum_abs_error_after_map": 0.0,
+            "sum_squared_error_after_map": 0.0, "max_error_after_map": 0.0,
+            "max_unmapped_error": 0.0, "weights_over_threshold_after_map": 0,
         } for t in thresholds
     }
     tensor_manifest = []
@@ -162,6 +165,36 @@ def main() -> int:
 
                     for t in thresholds:
                         selected = np.flatnonzero(abs_error > t)
+
+                        # Measure error over every eligible weight after applying this map.
+                        # Unselected positions keep their original Q4_0 error; selected
+                        # positions receive the FP16-rounded residual.
+                        post_delta = delta.copy()
+                        if selected.size:
+                            residuals16 = delta[selected].astype(np.float16).astype(np.float32)
+                            post_delta[selected] = delta[selected] - residuals16
+                        abs_after_map = np.abs(post_delta)
+                        stats[t]["eligible_weight_count"] += int(source.size)
+                        stats[t]["sum_abs_error_after_map"] += float(
+                            np.sum(abs_after_map, dtype=np.float64)
+                        )
+                        stats[t]["sum_squared_error_after_map"] += float(
+                            np.sum(post_delta.astype(np.float64) ** 2, dtype=np.float64)
+                        )
+                        stats[t]["max_error_after_map"] = max(
+                            stats[t]["max_error_after_map"],
+                            float(abs_after_map.max(initial=0.0)),
+                        )
+                        unmapped = abs_error <= t
+                        if np.any(unmapped):
+                            stats[t]["max_unmapped_error"] = max(
+                                stats[t]["max_unmapped_error"],
+                                float(abs_error[unmapped].max()),
+                            )
+                        stats[t]["weights_over_threshold_after_map"] += int(
+                            np.count_nonzero(abs_after_map > t)
+                        )
+
                         if selected.size == 0:
                             continue
                         tensor_counts[t] += int(selected.size)
@@ -211,11 +244,19 @@ def main() -> int:
             stream.close()
 
     # File sizes are read from disk, not estimated.
+    total_model_weights = max(1, sum(int(x["numel"]) for x in inventory))
     for t in thresholds:
         stats[t]["map_bytes"] = map_paths[t].stat().st_size
         stats[t]["map_mib"] = stats[t]["map_bytes"] / (1024 ** 2)
         stats[t]["correction_fraction_percent"] = (
-            stats[t]["correction_count"] / max(1, sum(int(x["numel"]) for x in inventory)) * 100
+            stats[t]["correction_count"] / total_model_weights * 100
+        )
+        eligible_count = max(1, stats[t]["eligible_weight_count"])
+        stats[t]["mean_absolute_error_after_map"] = (
+            stats[t]["sum_abs_error_after_map"] / eligible_count
+        )
+        stats[t]["rmse_after_map"] = math.sqrt(
+            stats[t]["sum_squared_error_after_map"] / eligible_count
         )
         stats[t]["map_format"] = "sorted delta-coded global flat index (unsigned LEB128) + FP16 residual"
         stats[t]["map_file"] = str(map_paths[t])
@@ -250,7 +291,9 @@ def main() -> int:
             f"> {t:g}: {s['correction_count']:,} pesos | "
             f"{s['blocks_affected']:,} blocos | {s['tensors_affected']:,} tensores | "
             f"mapa={s['map_bytes']:,} bytes ({s['map_mib']:.3f} MiB) | "
-            f"erro máximo após correção FP16={s['max_error_after_fp16_residual']:.8g} | "
+            f"máx. erro corrigido={s['max_error_after_fp16_residual']:.8g} | "
+            f"máx. erro global pós-mapa={s['max_error_after_map']:.8g} | "
+            f"RMSE pós-mapa={s['rmse_after_map']:.8g} | "
             f"pesos corrigidos ainda com erro={s['corrected_weights_still_nonzero_error']:,}"
         )
     print(f"Relatório: {output / 'report.json'}")
