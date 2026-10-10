@@ -549,3 +549,31 @@ Execute usando os arquivos criados pelo comando `compare_bnb_weights.py --export
 O script valida cada tensor do manifesto contra um módulo `Linear4bit` de dimensões compatíveis. Ele também converte automaticamente o prefixo `model.language_model.layers.*` do manifesto em `model.layers.*` quando esse for o nome exposto pelo `AutoModelForCausalLM` text-only, registrando quantos aliases foram resolvidos. Se alguma correção continuar sem correspondência, ele interrompe em vez de ignorá-la silenciosamente. Por padrão, `--device-map gpu` força o modelo inteiro para CUDA 0 para evitar o erro do bitsandbytes 4-bit quando `device_map="auto"` envia módulos para CPU/disco. Isso pode causar CUDA OOM se a VRAM livre não for suficiente; nesse caso, o modelo não será automaticamente dividido entre CPU e GPU. O carregador também modifica a configuração NF4 em memória para usar o dtype escolhido, sem passar uma segunda `quantization_config` que seria ignorada pelo Transformers. O JSON de saída inclui quantidade de hooks, diferença máxima/RMSE dos logits, mudança do próximo token, textos gerados sem/com mapa e tempos de geração.
 
 **Limitação:** o hook implementa a contribuição esparsa por gathers e `scatter_add`; adiciona trabalho em cada camada com correções e pode reduzir a velocidade, especialmente durante geração token a token. Primeiro valide a correção e o resultado numérico; otimização de desempenho é uma etapa posterior. O teste usa um único prompt e não substitui avaliação de perplexidade ou de qualidade em um conjunto de tarefas.
+
+
+## Validar se as correções esparsas aproximam os logits do BF16
+
+Depois de gerar `correction_map_gt_0p01.bin` e `correction_map_manifest.json` com `compare_bnb_weights.py --export-corrections --correction-threshold 0.01`, o script `apply_bnb_corrections.py` pode comparar três casos na mesma entrada: NF4 sem correção, NF4 com o mapa e checkpoint de referência sem quantização.
+
+No PowerShell:
+
+```powershell
+git pull
+
+.\.venv-smoke\Scripts\python.exe apply_bnb_corrections.py `
+  --model "techwithsergiu/Qwen3.5-text-4B-bnb-4bit" `
+  --map-file ".\bnb_weight_validation\correction_map_gt_0p01.bin" `
+  --manifest ".\bnb_weight_validation\correction_map_manifest.json" `
+  --prompt "Explique brevemente por que o céu parece azul." `
+  --max-new-tokens 48 `
+  --device-map gpu `
+  --compute-dtype float16 `
+  --reference-model "techwithsergiu/Qwen3.5-text-4B" `
+  --reference-dtype auto `
+  --reference-max-cpu-memory "4GiB" `
+  --output ".\bnb_weight_validation\correction_vs_bf16.json"
+```
+
+A referência deve ser o checkpoint BF16/textual correspondente à base usada pelo modelo NF4, não um modelo apenas parecido. `--reference-dtype auto` respeita o dtype declarado pelo checkpoint; confirme no relatório o campo `reference_embedding_dtype`. O script libera o modelo NF4 antes de carregar a referência e limita a RAM usada pelo modelo de referência. Camadas excedentes podem ser transferidas para `bf16_offload\` no disco, exigindo espaço livre adicional e tornando a avaliação significativamente mais lenta. O mapa temporário não modifica nenhum checkpoint.
+
+O relatório calcula, para os logits do último token de entrada, RMSE, MAE, diferença máxima, similaridade cosseno e coincidência do token mais provável de cada versão em relação à referência. **`correction_rmse_improvement_percent` positivo significa que os logits corrigidos ficaram mais próximos pelo RMSE; negativo significa que ficaram mais distantes.** Um único prompt é apenas um teste inicial; repita a comparação com vários prompts para verificar se o efeito é consistente.
