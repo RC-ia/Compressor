@@ -506,7 +506,7 @@ def main() -> int:
         map_path = spec["map_path"]
         manifest_path = spec["manifest_path"]
         print(
-            f"\\n=== MAPA {map_index}/{len(map_specs)} (limiar {spec['threshold']}) ===",
+            f"\n=== MAPA {map_index}/{len(map_specs)} (limiar {spec['threshold']}) ===",
             flush=True,
         )
         records = load_map(map_path, manifest_path)
