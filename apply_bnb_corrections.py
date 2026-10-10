@@ -138,16 +138,42 @@ def install_hooks(model: nn.Module, records: list[dict[str, Any]], state: dict[s
                   max_temp_elements: int = 1_000_000) -> tuple[list[Any], dict[str, int]]:
     modules = dict(model.named_modules())
     handles = []
-    stats = {"installed": 0, "missing": 0, "shape_mismatch": 0, "not_4bit_linear": 0}
+    stats = {
+        "installed": 0, "missing": 0, "shape_mismatch": 0,
+        "not_4bit_linear": 0, "alias_resolved": 0,
+    }
     missing_names = []
+    alias_examples = []
 
     for record in records:
-        module_name = record["module"]
-        module = modules.get(module_name)
+        manifest_module_name = record["module"]
+        # The sidecar was built from the text checkpoint's tensor keys, which can
+        # retain the multimodal wrapper "model.language_model." even though
+        # AutoModelForCausalLM exposes those modules under "model.".
+        candidates = [manifest_module_name]
+        if manifest_module_name.startswith("model.language_model."):
+            candidates.append("model." + manifest_module_name[len("model.language_model."):])
+        elif manifest_module_name.startswith("language_model."):
+            candidates.append("model." + manifest_module_name[len("language_model."):])
+
+        module_name = next((name for name in candidates if name in modules), None)
+        module = modules.get(module_name) if module_name is not None else None
         if module is None:
             stats["missing"] += 1
-            missing_names.append(module_name)
+            missing_names.append({
+                "manifest_name": manifest_module_name,
+                "tried_names": candidates,
+            })
             continue
+
+        if module_name != manifest_module_name:
+            stats["alias_resolved"] += 1
+            if len(alias_examples) < 20:
+                alias_examples.append({
+                    "manifest_name": manifest_module_name,
+                    "resolved_module": module_name,
+                })
+        record["resolved_module"] = module_name
         if Linear4bit is not None and not isinstance(module, Linear4bit):
             stats["not_4bit_linear"] += 1
             continue
@@ -202,6 +228,7 @@ def install_hooks(model: nn.Module, records: list[dict[str, Any]], state: dict[s
         details = {
             "stats": stats,
             "missing_examples": missing_names[:20],
+            "alias_examples": alias_examples,
         }
         for handle in handles:
             handle.remove()
