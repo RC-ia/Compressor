@@ -616,11 +616,12 @@ git pull
   --device-map gpu `
   --compute-dtype float16 `
   --reference-model "techwithsergiu/Qwen3.5-text-4B" `
-  --reference-dtype auto `
+  --reference-dtype float16 `
   --reference-max-cpu-memory "4GiB" `
+  --reference-gpu-memory "3GiB" `
   --output ".\bnb_weight_validation\correction_vs_bf16_005_004.json"
 ```
 
-A referência fica no dtype nativo do checkpoint (`torch.bfloat16` quando confirmado no relatório), usando CPU/disco conforme o limite de memória. O arquivo JSON contém a diferença NF4 versus cada mapa e a distância de todas as versões ao BF16. Os textos gerados são incluídos para conferência, embora a principal comparação numérica seja feita diretamente nos logits do último token de entrada.
+A referência BF16 original é carregada como FP16 para permitir execução na GTX 1050 Ti, que não possui suporte nativo a operações BF16. `--reference-gpu-memory "3GiB"` reserva até 3 GiB da GPU para camadas da referência, enquanto `--reference-max-cpu-memory "4GiB"` limita a RAM; somente o excedente vai para disco. O relatório indica `reference_embedding_dtype` e o mapa de dispositivos efetivamente usados. Essa variante avalia a referência com pesos BF16 convertidos para FP16 e cálculo FP16 — não é uma execução de referência BF16 nativa. O arquivo JSON contém a diferença NF4 versus cada mapa e a distância das versões corrigidas à mesma referência. Os textos gerados são incluídos para conferência, embora a comparação numérica principal use os logits do último token da entrada.
 
 A leitura do mapa foi alterada para usar buffers compactos durante a decodificação, e apenas um mapa é mantido em memória/VRAM de cada vez. Mesmo assim, o mapa 0,004 adiciona 14,3 milhões de resíduos e pode consumir centenas de MB de VRAM ao executar os hooks; se a CUDA ficar sem memória, tente diminuir o limiar de correções para 0,005 ou libere outros processos da GPU.
