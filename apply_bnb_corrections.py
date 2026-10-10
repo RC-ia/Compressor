@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 try:
     from bitsandbytes.nn import Linear4bit
