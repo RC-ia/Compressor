@@ -518,7 +518,9 @@ def main() -> int:
         )
         reference_model.eval()
         reference_device_map = getattr(reference_model, "hf_device_map", {})
-        reference_input_device = choose_input_device(reference_model)
+        # This model is deliberately dispatched to CPU/disk only; keep input IDs
+        # on CPU even if an input embedding happens to be disk-offloaded.
+        reference_input_device = torch.device("cpu")
         reference_inputs = {
             key: value.to(reference_input_device)
             for key, value in reference_inputs_cpu.items()
