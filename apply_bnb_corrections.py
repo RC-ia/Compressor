@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 try:
     from bitsandbytes.nn import Linear4bit
@@ -301,7 +301,10 @@ def main() -> int:
     parser.add_argument("--manifest", required=True, help="correction_map_manifest.json correspondente.")
     parser.add_argument("--prompt", default="Explique brevemente por que o céu parece azul.")
     parser.add_argument("--max-new-tokens", type=int, default=48)
-    parser.add_argument("--device-map", default="auto", help="Valor passado ao from_pretrained; padrão auto.")
+    parser.add_argument(
+        "--device-map", choices=["gpu", "auto"], default="gpu",
+        help="'gpu' força o modelo inteiro na CUDA 0; 'auto' permite dispatch automático (pode falhar em BNB 4-bit)."
+    )
     parser.add_argument("--compute-dtype", choices=["float16", "bfloat16", "float32"],
                         default="float16",
                         help="Precisão de cálculo das camadas NF4; float16 é o padrão para GPUs Pascal/GTX 10.")
@@ -331,18 +334,39 @@ def main() -> int:
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=compute_dtypes[args.compute_dtype],
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_storage=torch.uint8,
-    )
+
+    # This repository already contains a BNB quantization_config. Modify that
+    # loaded config in memory instead of passing a second quantization_config,
+    # which Transformers intentionally ignores for an already-quantized model.
+    model_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    saved_quant_config = getattr(model_config, "quantization_config", None)
+    if isinstance(saved_quant_config, dict):
+        saved_quant_config = dict(saved_quant_config)
+        saved_quant_config["bnb_4bit_compute_dtype"] = args.compute_dtype
+        model_config.quantization_config = saved_quant_config
+    elif saved_quant_config is not None and hasattr(saved_quant_config, "bnb_4bit_compute_dtype"):
+        saved_quant_config.bnb_4bit_compute_dtype = compute_dtypes[args.compute_dtype]
+    else:
+        raise RuntimeError(
+            "O checkpoint não expõe uma quantization_config bitsandbytes reconhecível."
+        )
+
+    selected_device_map = {"": 0} if args.device_map == "gpu" else "auto"
+    if args.device_map == "gpu" and not torch.cuda.is_available():
+        raise RuntimeError("--device-map gpu exige torch.cuda.is_available() == True.")
+    if args.device_map == "gpu":
+        free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+        print(
+            f"CUDA 0: {free_bytes / 1024**3:.2f} GiB livres de "
+            f"{total_bytes / 1024**3:.2f} GiB; carregamento será forçado para a GPU.",
+            flush=True,
+        )
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        device_map=args.device_map,
-        torch_dtype=compute_dtypes[args.compute_dtype],
-        quantization_config=quantization_config,
+        config=model_config,
+        device_map=selected_device_map,
+        dtype=compute_dtypes[args.compute_dtype],
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
@@ -381,6 +405,8 @@ def main() -> int:
         "prompt": args.prompt,
         "max_new_tokens": args.max_new_tokens,
         "compute_dtype": args.compute_dtype,
+        "requested_device_map": args.device_map,
+        "actual_device_map": getattr(model, "hf_device_map", {}),
         "logit_comparison": logit_metrics,
         "baseline_generation": baseline_text,
         "corrected_generation": corrected_text,
