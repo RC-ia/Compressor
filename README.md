@@ -501,6 +501,18 @@ Execute a comparação no modelo original local e no NF4 publicado:
   --output-dir bnb_weight_validation
 ```
 
+Para gerar o mapa de correções reais durante a mesma varredura, acrescente `--export-corrections --correction-threshold 0.01`:
+
+```powershell
+.\.venv-smoke\Scripts\python.exe compare_bnb_weights.py `
+  --source-model ".\Qwen3.5-4B" `
+  --quantized-model "techwithsergiu/Qwen3.5-text-4B-bnb-4bit" `
+  --device cuda `
+  --export-corrections `
+  --correction-threshold 0.01 `
+  --output-dir bnb_weight_validation
+```
+
 O primeiro uso baixa o checkpoint NF4 de aproximadamente 3,12 GB se ele ainda não estiver no cache. Para usar os arquivos BF16 text-only exatos que deram origem à quantização, troque `--source-model` por `techwithsergiu/Qwen3.5-text-4B`; isso pode exigir baixar vários GB adicionais. Também é possível apontar `--quantized-model` a um diretório local já baixado.
 
 Saídas:
