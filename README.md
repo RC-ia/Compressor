@@ -414,7 +414,7 @@ Para obter o erro de **cada peso** em uma matriz específica (o CSV pode ficar g
 
 Esse modo gera também `all_weight_errors.csv`, com uma linha por peso e seu índice/posição. `--top-k 2000` aumenta a quantidade de piores pesos e blocos listados. Use o nome exato do tensor retornado pelo script existente `compare_representatives_vs_q4.py --list-tensors`.
 
-**Importante:** este teste quantiza os valores BF16 de origem com uma implementação Q4_0 em blocos e reconstrói os valores armazenados (inclusive a escala FP16); ele não lê nem decodifica um arquivo GGUF Q4 externo. As métricas de ranking são por peso/bloco, sem médias globais.
+**Importante:** este teste quantiza os valores do Safetensors de origem com uma implementação Q4_0 em blocos e reconstrói os valores armazenados (inclusive a escala FP16); confira `source_dtype` nos CSVs para confirmar se a origem é `bfloat16`. Ele não lê nem decodifica um arquivo GGUF Q4 externo. As métricas de ranking são por peso/bloco, sem médias globais.
 
 ## Comparação direta: representantes globais, por linha e Q4_0
 
