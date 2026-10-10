@@ -89,9 +89,10 @@ def fit_rowwise_codebooks(
 
         for _ in range(max_iter):
             boundaries = (centers[:, :-1] + centers[:, 1:]) * 0.5
-            assignments = np.sum(
-                ordered[:, None, :] >= boundaries[:, :, None], axis=1
-            ).astype(np.int32, copy=False)
+            assignments = np.vstack([
+                np.searchsorted(boundaries[row], ordered[row], side="right")
+                for row in range(batch_rows)
+            ]).astype(np.int32, copy=False)
             combined = (row_offsets + assignments).reshape(-1)
             counts = np.bincount(combined, minlength=batch_rows * group_count).reshape(
                 batch_rows, group_count
@@ -128,9 +129,10 @@ def assign_rowwise_indices(
         block = values[row_start:row_end]
         centers = codebooks[row_start:row_end]
         boundaries = (centers[:, :-1] + centers[:, 1:]) * 0.5
-        indices[row_start:row_end] = np.sum(
-            block[:, None, :] >= boundaries[:, :, None], axis=1
-        ).astype(np.uint8)
+        indices[row_start:row_end] = np.vstack([
+            np.searchsorted(boundaries[row], block[row], side="right")
+            for row in range(block.shape[0])
+        ]).astype(np.uint8, copy=False)
     return indices
 
 
